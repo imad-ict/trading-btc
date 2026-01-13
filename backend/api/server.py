@@ -276,10 +276,10 @@ def create_app() -> FastAPI:
         lifespan=lifespan,
     )
     
-    # CORS
+    # CORS - Allow all origins for Render deployment
     app.add_middleware(
         CORSMiddleware,
-        allow_origins=["http://localhost:3000", "http://localhost:3001", "http://127.0.0.1:3000", "http://127.0.0.1:3001"],
+        allow_origins=["*"],
         allow_credentials=True,
         allow_methods=["*"],
         allow_headers=["*"],
@@ -289,6 +289,48 @@ def create_app() -> FastAPI:
 
 
 app = create_app()
+
+
+# ═══════════════════════════════════════════════════════════════════
+# STATIC FILE SERVING (Frontend)
+# ═══════════════════════════════════════════════════════════════════
+
+from pathlib import Path
+from fastapi.staticfiles import StaticFiles
+from fastapi.responses import FileResponse
+
+# Check if frontend build exists
+FRONTEND_DIR = Path(__file__).parent.parent / "static"
+
+if FRONTEND_DIR.exists():
+    # Serve static files from /static
+    app.mount("/static", StaticFiles(directory=FRONTEND_DIR), name="static")
+    
+    @app.get("/", include_in_schema=False)
+    async def serve_index():
+        """Serve the frontend index.html."""
+        index_file = FRONTEND_DIR / "index.html"
+        if index_file.exists():
+            return FileResponse(index_file)
+        return {"message": "Frontend not found. API is running at /api/status"}
+    
+    @app.get("/{path:path}", include_in_schema=False)
+    async def serve_frontend(path: str):
+        """Serve frontend files or fallback to index.html for SPA routing."""
+        # Skip API routes
+        if path.startswith("api/") or path.startswith("ws/"):
+            return {"detail": "Not found"}
+        
+        file_path = FRONTEND_DIR / path
+        if file_path.exists() and file_path.is_file():
+            return FileResponse(file_path)
+        
+        # SPA fallback
+        index_file = FRONTEND_DIR / "index.html"
+        if index_file.exists():
+            return FileResponse(index_file)
+        
+        return {"detail": "Not found"}
 
 
 # ═══════════════════════════════════════════════════════════════════
