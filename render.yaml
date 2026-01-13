@@ -1,0 +1,34 @@
+# Render Blueprint - trading-btc
+# https://render.com/docs/blueprint-spec
+
+services:
+  # Backend API Service
+  - type: web
+    name: trading-btc-api
+    runtime: docker
+    dockerfilePath: ./Dockerfile
+    region: virginia
+    plan: free
+    healthCheckPath: /api/status
+    envVars:
+      - key: BINANCE_MODE
+        value: testnet
+      - key: DEBUG
+        value: false
+      - key: DATABASE_URL
+        sync: false  # Set manually in Render dashboard
+      # Add these in Render dashboard:
+      # - TESTNET_API_KEY
+      # - TESTNET_API_SECRET
+      # - LIVE_API_KEY (optional)
+      # - LIVE_API_SECRET (optional)
+
+  # Frontend Static Site (Optional - deploy separately)
+  # - type: web
+  #   name: trading-btc-dashboard
+  #   runtime: static
+  #   buildCommand: cd frontend && npm install && npm run build
+  #   staticPublishPath: frontend/out
+  #   envVars:
+  #     - key: NEXT_PUBLIC_API_URL
+  #       value: https://trading-btc-api.onrender.com
