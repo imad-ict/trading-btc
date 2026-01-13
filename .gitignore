@@ -1,0 +1,50 @@
+# Dependencies
+node_modules/
+backend/venv/
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.Python
+
+# Environment files
+.env
+.env.local
+backend/.env
+backend/settings.json
+
+# Database
+*.db
+*.sqlite3
+trading.db
+
+# Build outputs
+.next/
+out/
+dist/
+build/
+*.egg-info/
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Logs
+*.log
+logs/
+backend/logs/
+
+# Coverage
+.coverage
+htmlcov/
+.pytest_cache/
+
+# Misc
+*.bak
+*.tmp

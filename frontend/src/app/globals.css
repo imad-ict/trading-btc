@@ -1,0 +1,138 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+/* Institutional Terminal Theme */
+:root {
+  --bg-primary: #0a0a0f;
+  --bg-secondary: #12121a;
+  --bg-tertiary: #1a1a24;
+  --border-color: #1e1e2a;
+  --text-primary: #ffffff;
+  --text-secondary: #9ca3af;
+  --text-muted: #6b7280;
+  --profit: #00d48a;
+  --loss: #ff4757;
+  --accent-blue: #3b82f6;
+  --accent-yellow: #fbbf24;
+}
+
+* {
+  box-sizing: border-box;
+  padding: 0;
+  margin: 0;
+}
+
+html,
+body {
+  max-width: 100vw;
+  overflow-x: hidden;
+  background-color: var(--bg-primary);
+  color: var(--text-primary);
+  font-family: 'JetBrains Mono', 'Fira Code', ui-monospace, monospace;
+}
+
+/* Scrollbar styling */
+::-webkit-scrollbar {
+  width: 6px;
+  height: 6px;
+}
+
+::-webkit-scrollbar-track {
+  background: var(--bg-secondary);
+}
+
+::-webkit-scrollbar-thumb {
+  background: var(--border-color);
+  border-radius: 3px;
+}
+
+::-webkit-scrollbar-thumb:hover {
+  background: #2a2a3a;
+}
+
+/* Custom utility classes */
+@layer components {
+  .card {
+    @apply bg-terminal-card border border-terminal-border rounded-lg;
+  }
+
+  .stat-value {
+    @apply text-2xl font-bold tabular-nums;
+  }
+
+  .stat-label {
+    @apply text-xs text-terminal-muted uppercase tracking-wider;
+  }
+
+  .profit-text {
+    @apply text-profit;
+  }
+
+  .loss-text {
+    @apply text-loss;
+  }
+
+  .btn-primary {
+    @apply bg-accent-blue hover:bg-blue-600 text-white px-4 py-2 rounded font-medium transition-colors;
+  }
+
+  .btn-danger {
+    @apply bg-loss hover:bg-red-600 text-white px-4 py-2 rounded font-medium transition-colors;
+  }
+
+  .panel-header {
+    @apply text-xs font-semibold uppercase tracking-wider text-terminal-muted px-4 py-3 border-b border-terminal-border;
+  }
+
+  .data-row {
+    @apply flex justify-between items-center py-2 px-4 border-b border-terminal-border last:border-0;
+  }
+
+  .status-badge {
+    @apply px-2 py-0.5 rounded text-xs font-medium uppercase;
+  }
+
+  .status-running {
+    @apply bg-profit/20 text-profit;
+  }
+
+  .status-stopped {
+    @apply bg-terminal-muted/20 text-terminal-muted;
+  }
+
+  .status-halted {
+    @apply bg-loss/20 text-loss;
+  }
+}
+
+/* Pulse animation for live indicators */
+@keyframes pulse-live {
+  0%, 100% {
+    opacity: 1;
+  }
+  50% {
+    opacity: 0.5;
+  }
+}
+
+.pulse-live {
+  animation: pulse-live 2s ease-in-out infinite;
+}
+
+/* Grid layout for dashboard */
+.dashboard-grid {
+  display: grid;
+  grid-template-columns: 1fr 320px;
+  grid-template-rows: auto 1fr auto;
+  gap: 1rem;
+  height: 100vh;
+  padding: 1rem;
+}
+
+@media (max-width: 1024px) {
+  .dashboard-grid {
+    grid-template-columns: 1fr;
+    grid-template-rows: auto auto 1fr auto;
+  }
+}

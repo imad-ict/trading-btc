@@ -1,0 +1,149 @@
+import { useCallback, useEffect, useRef, useState } from 'react'
+import { useTradeStore } from '@/stores/tradeStore'
+
+const WS_URL = process.env.NEXT_PUBLIC_WS_URL || 'ws://localhost:8001/ws/live'
+
+export function useWebSocket() {
+    const wsRef = useRef<WebSocket | null>(null)
+    const reconnectTimeoutRef = useRef<NodeJS.Timeout | null>(null)
+    const [isConnected, setIsConnected] = useState(false)
+    const [reconnectAttempts, setReconnectAttempts] = useState(0)
+
+    const {
+        updateFromStatus,
+        updatePrice,
+        setActiveTrade,
+        addTrade,
+        addExplanationLog,
+        setHalted,
+    } = useTradeStore()
+
+    const connect = useCallback(() => {
+        if (wsRef.current?.readyState === WebSocket.OPEN) {
+            return
+        }
+
+        try {
+            const ws = new WebSocket(WS_URL)
+            wsRef.current = ws
+
+            ws.onopen = () => {
+                console.log('WebSocket connected')
+                setIsConnected(true)
+                setReconnectAttempts(0)
+            }
+
+            ws.onclose = () => {
+                console.log('WebSocket disconnected')
+                setIsConnected(false)
+                scheduleReconnect()
+            }
+
+            ws.onerror = (error) => {
+                console.error('WebSocket error:', error)
+            }
+
+            ws.onmessage = (event) => {
+                try {
+                    const message = JSON.parse(event.data)
+                    handleMessage(message)
+                } catch (error) {
+                    console.error('Failed to parse message:', error)
+                }
+            }
+        } catch (error) {
+            console.error('Failed to connect:', error)
+            scheduleReconnect()
+        }
+    }, [])
+
+    const disconnect = useCallback(() => {
+        if (reconnectTimeoutRef.current) {
+            clearTimeout(reconnectTimeoutRef.current)
+        }
+        if (wsRef.current) {
+            wsRef.current.close()
+            wsRef.current = null
+        }
+        setIsConnected(false)
+    }, [])
+
+    const scheduleReconnect = useCallback(() => {
+        if (reconnectAttempts >= 10) {
+            console.error('Max reconnect attempts reached')
+            return
+        }
+
+        const delay = Math.min(2000 * Math.pow(2, reconnectAttempts), 30000)
+        console.log(`Reconnecting in ${delay}ms (attempt ${reconnectAttempts + 1})`)
+
+        reconnectTimeoutRef.current = setTimeout(() => {
+            setReconnectAttempts((prev) => prev + 1)
+            connect()
+        }, delay)
+    }, [reconnectAttempts, connect])
+
+    const handleMessage = useCallback((message: any) => {
+        const { type, data } = message
+
+        switch (type) {
+            case 'init':
+            case 'status':
+                updateFromStatus(data)
+                break
+
+            case 'price':
+                if (data && typeof data === 'object') {
+                    Object.entries(data).forEach(([symbol, price]) => {
+                        updatePrice(symbol, price as number)
+                    })
+                }
+                break
+
+            case 'trade':
+                if (data.state === 'ENTRY_EXECUTED' || data.state === 'POSITION_MANAGEMENT') {
+                    setActiveTrade({
+                        symbol: data.symbol,
+                        direction: data.direction,
+                        entry_price: data.entry_price,
+                        stop_loss: data.stop_loss,
+                    })
+                } else if (data.state === 'EXIT_LOGGED') {
+                    addTrade(data)
+                    setActiveTrade(null)
+                }
+
+                // Add to explanation log
+                if (data.liquidity_event || data.entry_logic) {
+                    const log = `[${new Date().toLocaleTimeString()}] ${data.direction} ${data.symbol}: ${data.liquidity_event || data.entry_logic}`
+                    addExplanationLog(log)
+                }
+                break
+
+            case 'emergency_stop':
+                setHalted(true, 'Emergency stop triggered')
+                break
+
+            default:
+                console.log('Unknown message type:', type)
+        }
+    }, [updateFromStatus, updatePrice, setActiveTrade, addTrade, addExplanationLog, setHalted])
+
+    // Heartbeat
+    useEffect(() => {
+        const interval = setInterval(() => {
+            if (wsRef.current?.readyState === WebSocket.OPEN) {
+                wsRef.current.send('ping')
+            }
+        }, 30000)
+
+        return () => clearInterval(interval)
+    }, [])
+
+    return {
+        isConnected,
+        connect,
+        disconnect,
+        reconnectAttempts,
+    }
+}

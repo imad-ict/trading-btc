@@ -1,0 +1,53 @@
+version: '3.8'
+
+services:
+  postgres:
+    image: postgres:16-alpine
+    container_name: trading_postgres
+    environment:
+      POSTGRES_DB: trading
+      POSTGRES_USER: trader
+      POSTGRES_PASSWORD: ${DB_PASSWORD:-trading123}
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    ports:
+      - "5432:5432"
+    healthcheck:
+      test: [ "CMD-SHELL", "pg_isready -U trader -d trading" ]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  backend:
+    build: ./backend
+    container_name: trading_backend
+    ports:
+      - "8001:8001"
+    environment:
+      - DATABASE_URL=postgresql+asyncpg://trader:${DB_PASSWORD:-trading123}@postgres/trading
+      - BINANCE_MODE=${BINANCE_MODE:-testnet}
+      - ENCRYPTION_KEY=${ENCRYPTION_KEY:-}
+      - BINANCE_API_KEY_ENCRYPTED=${BINANCE_API_KEY_ENCRYPTED:-}
+      - BINANCE_API_SECRET_ENCRYPTED=${BINANCE_API_SECRET_ENCRYPTED:-}
+      - SYMBOLS=${SYMBOLS:-BTCUSDT,ETHUSDT,SOLUSDT}
+    depends_on:
+      postgres:
+        condition: service_healthy
+    restart: unless-stopped
+    volumes:
+      - ./backend/logs:/app/logs
+
+  frontend:
+    build: ./frontend
+    container_name: trading_frontend
+    ports:
+      - "3000:3000"
+    environment:
+      - NEXT_PUBLIC_API_URL=http://localhost:8001
+      - NEXT_PUBLIC_WS_URL=ws://localhost:8001/ws/live
+    depends_on:
+      - backend
+    restart: unless-stopped
+
+volumes:
+  pgdata:
