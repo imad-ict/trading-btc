@@ -102,13 +102,35 @@ export function useWebSocket() {
 
             case 'trade':
                 if (data) {
-                    setActiveTrade({
-                        symbol: data.symbol,
-                        direction: data.direction,
-                        entry_price: data.entry,
-                        stop_loss: data.sl,
-                    })
-                    addExplanationLog(`✅ Trade opened: ${data.direction} ${data.symbol} @ $${data.entry}`)
+                    if (data.event === 'close') {
+                        // Trade closed - add to history and clear active
+                        addTrade({
+                            id: Date.now().toString(),
+                            symbol: data.symbol,
+                            direction: data.direction,
+                            entry_price: data.entry,
+                            exit_price: data.exit,
+                            stop_loss: data.sl,
+                            status: 'closed',
+                            result: data.result,
+                            pnl_usd: data.pnl_usd,
+                            pnl_pct: data.pnl_pct,
+                            liquidity_event: data.reason || '',
+                            market_state: 'expansion',
+                            entry_logic: data.reason || ''
+                        })
+                        setActiveTrade(null)
+                        addExplanationLog(`${data.result === 'WIN' ? '🟢' : '🔴'} Trade closed: ${data.symbol} | ${data.result} | $${data.pnl_usd?.toFixed(2) || 0}`)
+                    } else {
+                        // Trade opened
+                        setActiveTrade({
+                            symbol: data.symbol,
+                            direction: data.direction,
+                            entry_price: data.entry,
+                            stop_loss: data.sl,
+                        })
+                        addExplanationLog(`✅ Trade opened: ${data.direction} ${data.symbol} @ $${data.entry}`)
+                    }
                 }
                 break
 

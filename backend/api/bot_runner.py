@@ -618,6 +618,21 @@ class BotRunner:
                     self._log(f"Exit: ${exit_price:,.2f}")
                     self._log(f"{'='*50}")
                     
+                    # Broadcast trade completion to frontend
+                    if self._trade_callback:
+                        self._trade_callback({
+                            "event": "close",
+                            "symbol": pos.signal.symbol,
+                            "direction": pos.signal.direction.value,
+                            "entry": pos.signal.entry_price,
+                            "exit": exit_price,
+                            "sl": pos.signal.stop_loss,
+                            "result": result,
+                            "pnl_pct": pnl_pct,
+                            "pnl_usd": pnl_pct / 100 * pos.quantity * pos.signal.entry_price,
+                            "reason": reason
+                        })
+                    
                     self.active_position = None
                 else:
                     error = response.json().get("msg", response.text)
