@@ -61,11 +61,25 @@ class BotRunner:
         self.active_positions: Dict[str, ActivePosition] = {}
         self.max_positions = 3
         
-        # Trading state - REDUCED for quality over quantity
+        # Trading state - Institutional Scalping Model
         self.trades_today = 0
-        self.max_trades_per_day = 6  # Max 6 trades/day
+        self.losses_today = 0
+        self.daily_pnl = 0.0
+        self.starting_balance = 0.0
+        
+        # Trade limits
+        self.max_trades_per_day = 15  # 10-15 trades/day
+        self.max_losses_per_day = 4   # Stop after 4 losses
+        self.daily_loss_cap_pct = 0.02  # 2% daily loss = stop
+        self.daily_profit_lock_pct = 0.015  # 1.5% profit = stop
+        
         self.last_signal_time: Dict[str, float] = {}
-        self.signal_cooldown = 300  # 5 minute cooldown per symbol
+        self.signal_cooldown = 180  # 3 minute cooldown per symbol
+        
+        # Risk parameters
+        self.risk_per_trade_pct = 0.003  # 0.3% risk per trade
+        self.min_sl_distance_pct = 0.0015  # 0.15% min SL
+        self.max_sl_distance_pct = 0.0035  # 0.35% max SL
         
         # Candle aggregation
         self.current_candle: Dict[str, Dict] = {}
@@ -107,17 +121,27 @@ class BotRunner:
         
         self.settings = settings
         self.is_running = True
+        
+        # Reset daily state
         self.trades_today = 0
+        self.losses_today = 0
+        self.daily_pnl = 0.0
+        
+        # Capture starting balance for daily caps
+        balance = await self.get_balance()
+        self.starting_balance = balance if balance else 0
         
         # Start tasks
         self.ws_task = asyncio.create_task(self._stream_prices())
         self.kline_task = asyncio.create_task(self._stream_klines())
         self.strategy_task = asyncio.create_task(self._strategy_loop())
         
-        self._log(f"🚀 INSTITUTIONAL BOT STARTED")
+        self._log(f"🚀 INSTITUTIONAL SCALPING BOT STARTED")
+        self._log(f"💰 Starting Balance: ${self.starting_balance:,.2f}")
         self._log(f"📊 Monitoring: {settings.get('symbols', [])}")
         self._log(f"⚠️ Mode: {settings.get('mode', 'testnet').upper()}")
-        self._log(f"🎯 Strategy: Liquidity Sweep + Reclaim ONLY")
+        self._log(f"🎯 Strategy: Liquidity-Driven Mean Reversion")
+        self._log(f"📉 Risk: {self.risk_per_trade_pct*100:.1f}% | Max Trades: {self.max_trades_per_day}")
         
         if self._status_callback:
             self._status_callback("running")
@@ -331,6 +355,23 @@ class BotRunner:
                 
                 # Check trade limits
                 if self.trades_today >= self.max_trades_per_day:
+                    continue
+                
+                # Check daily loss cap (2%)
+                if self.starting_balance > 0:
+                    daily_pnl_pct = self.daily_pnl / self.starting_balance
+                    if daily_pnl_pct <= -self.daily_loss_cap_pct:
+                        if self.trades_today > 0:  # Only log once
+                            self._log(f"🛑 DAILY LOSS CAP HIT ({daily_pnl_pct*100:.2f}%) - NO MORE TRADES")
+                        continue
+                    # Check profit lock (1.5%)
+                    if daily_pnl_pct >= self.daily_profit_lock_pct:
+                        if self.trades_today > 0:
+                            self._log(f"💰 DAILY PROFIT LOCK ({daily_pnl_pct*100:.2f}%) - SECURING GAINS")
+                        continue
+                
+                # Check max losses
+                if self.losses_today >= self.max_losses_per_day:
                     continue
                 
                 # Check position limit

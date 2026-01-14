@@ -131,8 +131,8 @@ class TradeSignal:
     
     @property
     def is_valid(self) -> bool:
-        # Valid risk: 0.1% to 1%
-        return 0.001 <= self.risk_distance <= 0.01
+        # Valid SL distance: 0.15% to 0.35% (institutional scalping)
+        return 0.0015 <= self.risk_distance <= 0.0035
 
 
 class InstitutionalStrategy:
@@ -649,10 +649,10 @@ class ActivePosition:
         return False
     
     def get_partial_qty_tp1(self) -> float:
-        return self.quantity * 0.5
+        return self.quantity * 0.4  # 40% at TP1
     
     def get_partial_qty_tp2(self) -> float:
-        return self.quantity * 0.3
+        return self.quantity * 0.4  # 40% at TP2, 20% runners
     
     def should_exit(self, current_price: float) -> Tuple[bool, str]:
         """Check if SL hit."""
