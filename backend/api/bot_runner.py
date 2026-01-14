@@ -67,6 +67,21 @@ class BotRunner:
         # Candle aggregation
         self.current_candle: Dict[str, Dict] = {}
         self.candle_start_time: Dict[str, float] = {}
+        
+        # Binance Futures quantity precision (stepSize from exchangeInfo)
+        self.symbol_precision = {
+            "BTCUSDT": 3,   # 0.001 step
+            "ETHUSDT": 3,   # 0.001 step
+            "BNBUSDT": 2,   # 0.01 step
+            "SOLUSDT": 0,   # 1 step
+        }
+    
+    def _round_quantity(self, symbol: str, quantity: float) -> float:
+        """Round quantity to symbol's precision (stepSize compliance)."""
+        precision = self.symbol_precision.get(symbol, 3)
+        factor = 10 ** precision
+        # Round DOWN to avoid exceeding position size
+        return int(quantity * factor) / factor
     
     def set_callbacks(self, price_callback, status_callback, 
                       trade_callback=None, log_callback=None):
@@ -502,12 +517,18 @@ class BotRunner:
         try:
             side = "SELL" if pos.signal.direction == TradeDirection.LONG else "BUY"
             
+            # Round quantity to symbol precision (CRITICAL for Binance)
+            rounded_qty = self._round_quantity(pos.signal.symbol, quantity)
+            if rounded_qty <= 0:
+                self._log(f"⚠️ Quantity too small after rounding: {quantity} → {rounded_qty}")
+                return
+            
             timestamp = int(time.time() * 1000)
             params = {
                 "symbol": pos.signal.symbol,
                 "side": side,
                 "type": "MARKET",
-                "quantity": quantity,
+                "quantity": rounded_qty,
                 "timestamp": timestamp,
             }
             
@@ -553,12 +574,19 @@ class BotRunner:
         try:
             side = "SELL" if pos.signal.direction == TradeDirection.LONG else "BUY"
             
+            # Round quantity to symbol precision
+            rounded_qty = self._round_quantity(pos.signal.symbol, pos.remaining_qty)
+            if rounded_qty <= 0:
+                self._log(f"⚠️ Remaining quantity too small: {pos.remaining_qty}")
+                self.active_position = None
+                return
+            
             timestamp = int(time.time() * 1000)
             params = {
                 "symbol": pos.signal.symbol,
                 "side": side,
                 "type": "MARKET",
-                "quantity": pos.remaining_qty,
+                "quantity": rounded_qty,
                 "timestamp": timestamp,
             }
             
