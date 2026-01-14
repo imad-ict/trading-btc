@@ -277,13 +277,8 @@ class FailureReversalStrategy:
     def _detect_failures(self, symbol: str):
         """
         Detect FAILED PUSHES - the heart of this strategy.
-        
-        FAILED PUSH UP: Attempt to hold above VWAP that stalls
-        FAILED PUSH DOWN: Attempt to hold below VWAP that stalls
+        Works in ANY market, not just balance.
         """
-        if self.market_state.get(symbol) != MarketState.BALANCE:
-            return  # Only detect failures in BALANCE
-        
         candles = list(self.candles_5m.get(symbol, []))
         if len(candles) < 5:
             return
@@ -330,37 +325,38 @@ class FailureReversalStrategy:
         self.failed_pushes[symbol] = self.failed_pushes[symbol][-5:]
     
     def _detect_sweeps(self, symbol: str, candle: Candle):
-        """Detect liquidity sweeps at balance extremes."""
-        if self.market_state.get(symbol) != MarketState.BALANCE:
-            return
-        
+        """Detect liquidity sweeps - works in any market using swing levels."""
         if symbol not in self.pending_sweeps:
             self.pending_sweeps[symbol] = []
         
-        balance_high = self.balance_high.get(symbol)
-        balance_low = self.balance_low.get(symbol)
-        
-        if not balance_high or not balance_low:
+        # Use swing levels instead of balance levels
+        candles = list(self.candles_5m.get(symbol, []))
+        if len(candles) < 10:
             return
         
-        tolerance = candle.close * 0.001  # 0.1%
+        recent_highs = [c.high for c in candles[-10:]]
+        recent_lows = [c.low for c in candles[-10:]]
+        swing_high = max(recent_highs[:-1]) if len(recent_highs) > 1 else candle.high
+        swing_low = min(recent_lows[:-1]) if len(recent_lows) > 1 else candle.low
         
-        # SWEEP LOW (bullish setup forming)
-        if candle.low < balance_low - tolerance:
+        tolerance = candle.close * 0.0005  # 0.05%
+        
+        # SWEEP LOW (bullish setup)
+        if candle.low < swing_low - tolerance:
             # Check for rejection wick (lower wick > body)
-            if candle.lower_wick > candle.body_size:
+            if candle.lower_wick > candle.body_size * 0.3:
                 sweep = SweepEvent(
-                    level=balance_low,
+                    level=swing_low,
                     sweep_type="low",
                     sweep_candle=candle
                 )
                 self.pending_sweeps[symbol].append(sweep)
         
-        # SWEEP HIGH (bearish setup forming)
-        if candle.high > balance_high + tolerance:
-            if candle.upper_wick > candle.body_size:
+        # SWEEP HIGH (bearish setup)
+        if candle.high > swing_high + tolerance:
+            if candle.upper_wick > candle.body_size * 0.3:
                 sweep = SweepEvent(
-                    level=balance_high,
+                    level=swing_high,
                     sweep_type="high",
                     sweep_candle=candle
                 )
@@ -393,63 +389,42 @@ class FailureReversalStrategy:
     
     def generate_signal(self, symbol: str, current_candle: Candle) -> Optional[TradeSignal]:
         """
-        Generate signal using FAILURE-BASED logic.
+        Generate signal - SIMPLIFIED for higher frequency.
         
-        Requirements (ALL must be true):
-        1. Market is in BALANCE
-        2. A failure has been detected
-        3. Liquidity has been swept
-        4. Sweep has been reclaimed
-        5. 1 candle delay has passed (confirmation_pending = False)
-        6. DO NOT enter on momentum candle
+        Requirements:
+        1. Liquidity has been swept
+        2. Sweep has been reclaimed  
+        3. 1 candle delay (confirmation_pending = False)
+        4. Not a momentum candle
         """
-        # RULE 1: Must be BALANCE
-        state = self.market_state.get(symbol, MarketState.UNKNOWN)
-        if state != MarketState.BALANCE:
-            return None
-        
-        # RULE 2: Check for failures
-        failures = self.failed_pushes.get(symbol, [])
-        if not failures:
-            return None
-        
-        # RULE 3 & 4 & 5: Check for confirmed sweeps
+        # Check for confirmed sweeps (no failure requirement)
         for sweep in self.pending_sweeps.get(symbol, []):
             if not sweep.reclaimed:
                 continue
             if sweep.confirmation_pending:
                 continue  # Wait for 1 candle delay
             
-            # RULE 6: Do NOT enter on momentum candle
-            if current_candle.body_pct > 0.7:
-                continue  # Skip strong candles (momentum)
+            # Do NOT enter on strong momentum candle
+            if current_candle.body_pct > 0.8:
+                continue
             
-            # Find matching failure
+            # Generate signal based on sweep type
             if sweep.sweep_type == "low":
-                # Looking for FAILED_PUSH_DOWN → LONG
-                matching_failure = next(
-                    (f for f in failures if f.direction == "down"), 
-                    None
-                )
-                if matching_failure:
-                    return self._create_long_signal(symbol, sweep, matching_failure, current_candle)
+                return self._create_long_signal(symbol, sweep, current_candle)
             
             elif sweep.sweep_type == "high":
-                # Looking for FAILED_PUSH_UP → SHORT
-                matching_failure = next(
-                    (f for f in failures if f.direction == "up"),
-                    None
-                )
-                if matching_failure:
-                    return self._create_short_signal(symbol, sweep, matching_failure, current_candle)
+                return self._create_short_signal(symbol, sweep, current_candle)
         
         return None
     
     def _create_long_signal(self, symbol: str, sweep: SweepEvent, 
-                            failure: FailedPush, candle: Candle) -> Optional[TradeSignal]:
-        """Create LONG signal after bearish failure."""
+                            candle: Candle) -> Optional[TradeSignal]:
+        """Create LONG signal on sweep reclaim."""
         vwap = self.vwap.get(symbol, candle.close)
-        balance_high = self.balance_high.get(symbol, candle.close + candle.total_range * 3)
+        
+        # Use recent high as TP target
+        candles = list(self.candles_5m.get(symbol, []))
+        recent_high = max(c.high for c in candles[-10:]) if candles else candle.close + candle.total_range * 3
         
         # SL: Midpoint of sweep wick (NOT at the low)
         sweep_low = sweep.sweep_candle.low
@@ -457,11 +432,10 @@ class FailureReversalStrategy:
         sl = wick_midpoint * 0.999  # Tiny buffer
         
         # TP: Destination-based
-        tp1 = vwap  # Opposite side of balance
-        tp2 = balance_high  # Balance high (liquidity)
-        tp3 = balance_high + (balance_high - sweep_low)  # Expansion
-        
-        why_old_loses = f"Old system would enter on VWAP pullback BEFORE failure. Price was at ${failure.start_price:,.0f}, pushed down, and old system would buy the pullback. Instead, we waited for failure confirmation."
+        risk = candle.close - sl
+        tp1 = candle.close + risk * 1.5  # 1.5R
+        tp2 = candle.close + risk * 2.5  # 2.5R
+        tp3 = candle.close + risk * 4.0  # 4R
         
         signal = TradeSignal(
             symbol=symbol,
@@ -472,34 +446,30 @@ class FailureReversalStrategy:
             tp2=tp2,
             tp3=tp3,
             failure_type=FailureType.FAILED_PUSH_DOWN,
-            reason=f"Bears failed at ${failure.failure_price:,.0f} | Sweep @ ${sweep.level:,.0f} reclaimed",
-            why_old_system_would_lose=why_old_loses
+            reason=f"Low swept @ ${sweep.level:,.0f} | Reclaimed | LONG",
+            why_old_system_would_lose="Old system enters on pullback. We wait for sweep + reclaim."
         )
         
         if signal.is_valid:
-            # Clear used sweep and failure
             self.pending_sweeps[symbol] = [s for s in self.pending_sweeps[symbol] if s != sweep]
-            self.failed_pushes[symbol] = [f for f in self.failed_pushes[symbol] if f != failure]
             return signal
         return None
     
     def _create_short_signal(self, symbol: str, sweep: SweepEvent,
-                             failure: FailedPush, candle: Candle) -> Optional[TradeSignal]:
-        """Create SHORT signal after bullish failure."""
+                             candle: Candle) -> Optional[TradeSignal]:
+        """Create SHORT signal on sweep reclaim."""
         vwap = self.vwap.get(symbol, candle.close)
-        balance_low = self.balance_low.get(symbol, candle.close - candle.total_range * 3)
         
         # SL: Midpoint of sweep wick (NOT at the high)
         sweep_high = sweep.sweep_candle.high
         wick_midpoint = (sweep_high + sweep.level) / 2
         sl = wick_midpoint * 1.001  # Tiny buffer
         
-        # TP: Destination-based
-        tp1 = vwap
-        tp2 = balance_low
-        tp3 = balance_low - (sweep_high - balance_low)  # Expansion
-        
-        why_old_loses = f"Old system would enter SHORT on VWAP rejection BEFORE failure. Price was at ${failure.start_price:,.0f}, pushed up, and old system would sell. Instead, we waited for confirmation."
+        # TP: R:R based
+        risk = sl - candle.close
+        tp1 = candle.close - risk * 1.5  # 1.5R
+        tp2 = candle.close - risk * 2.5  # 2.5R
+        tp3 = candle.close - risk * 4.0  # 4R
         
         signal = TradeSignal(
             symbol=symbol,
@@ -510,13 +480,12 @@ class FailureReversalStrategy:
             tp2=tp2,
             tp3=tp3,
             failure_type=FailureType.FAILED_PUSH_UP,
-            reason=f"Bulls failed at ${failure.failure_price:,.0f} | Sweep @ ${sweep.level:,.0f} reclaimed",
-            why_old_system_would_lose=why_old_loses
+            reason=f"High swept @ ${sweep.level:,.0f} | Reclaimed | SHORT",
+            why_old_system_would_lose="Old system enters on rejection. We wait for sweep + reclaim."
         )
         
         if signal.is_valid:
             self.pending_sweeps[symbol] = [s for s in self.pending_sweeps[symbol] if s != sweep]
-            self.failed_pushes[symbol] = [f for f in self.failed_pushes[symbol] if f != failure]
             return signal
         return None
 
