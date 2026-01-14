@@ -18,18 +18,32 @@ export default function ActiveTradePanel() {
             </div>
         )
     }
+    // Early return if activeTrade doesn't have required properties
+    if (!activeTrade.entry_price || !activeTrade.stop_loss) {
+        return (
+            <div className="card">
+                <div className="panel-header">ACTIVE TRADE</div>
+                <div className="p-8 flex flex-col items-center justify-center text-center">
+                    <div className="text-4xl mb-2">⏳</div>
+                    <div className="text-terminal-muted text-sm">Loading trade data...</div>
+                </div>
+            </div>
+        )
+    }
 
-    const currentPrice = activeTrade.current_price || prices[activeTrade.symbol] || activeTrade.entry_price
+    const entryPrice = activeTrade.entry_price || 0
+    const stopLoss = activeTrade.stop_loss || 0
+    const currentPrice = activeTrade.current_price || prices[activeTrade.symbol] || entryPrice
     const isLong = activeTrade.direction === 'LONG'
 
     // Calculate P&L
-    const priceDiff = currentPrice - activeTrade.entry_price
+    const priceDiff = currentPrice - entryPrice
     const pnl = isLong ? priceDiff : -priceDiff
-    const pnlPct = (pnl / activeTrade.entry_price) * 100
+    const pnlPct = entryPrice > 0 ? (pnl / entryPrice) * 100 : 0
     const isProfitable = pnl >= 0
 
     // Calculate distance to SL
-    const slDistance = Math.abs(activeTrade.entry_price - activeTrade.stop_loss)
+    const slDistance = Math.abs(entryPrice - stopLoss) || 1
     const currentRR = Math.abs(pnl) / slDistance
     const displayRR = isProfitable ? currentRR : -currentRR
 
@@ -65,7 +79,7 @@ export default function ActiveTradePanel() {
                     <div className="text-center">
                         <div className="stat-label">Entry</div>
                         <div className="text-sm font-medium tabular-nums">
-                            ${activeTrade.entry_price.toLocaleString(undefined, { maximumFractionDigits: 2 })}
+                            ${entryPrice.toLocaleString(undefined, { maximumFractionDigits: 2 })}
                         </div>
                     </div>
                     <div className="text-center">
@@ -80,7 +94,7 @@ export default function ActiveTradePanel() {
                     <div className="text-center">
                         <div className="stat-label">Stop Loss</div>
                         <div className="text-sm font-medium tabular-nums text-loss">
-                            ${activeTrade.stop_loss.toLocaleString(undefined, { maximumFractionDigits: 2 })}
+                            ${stopLoss.toLocaleString(undefined, { maximumFractionDigits: 2 })}
                         </div>
                     </div>
                 </div>
