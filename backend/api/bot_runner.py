@@ -22,7 +22,7 @@ import json
 
 from strategy.institutional_strategy import (
     InstitutionalStrategy, TradeSignal, ActivePosition, 
-    Candle, TradeDirection, MarketState
+    Candle, TradeDirection, TrendDirection, EntryType
 )
 
 logger = logging.getLogger(__name__)

@@ -1,11 +1,19 @@
 """
-Multi-Position Institutional Strategy
+High Win-Rate Institutional Strategy v3
 
-Features:
-1. Multi-position support (one per symbol)
-2. Multiple entry types: Liquidity Sweep, CHoCH, FVG
-3. Multi-timeframe analysis: 15M context, 5M structure, 1M entry
-4. Independent SL management per position
+CORE PRINCIPLE: Trade WITH the trend, enter on CONFIRMED pullbacks
+
+Entry Requirements:
+1. TREND ALIGNMENT (Higher TF) - 15M trend direction
+2. ORDER BLOCK - Price returns to a demand/supply zone
+3. RSI CONFIRMATION - Momentum in trade direction
+4. STRUCTURE - Clear market structure (HH/HL for long, LH/LL for short)
+
+Win Rate Improvement:
+- Only trade with trend (no counter-trend)
+- Wait for pullback to Order Block (not just sweep)
+- RSI must show reversal (oversold for long, overbought for short)
+- Tighter SL at Order Block edge
 """
 import numpy as np
 from typing import Dict, List, Optional, Tuple
@@ -18,25 +26,21 @@ import logging
 logger = logging.getLogger(__name__)
 
 
-class MarketState(Enum):
-    ACCUMULATION = "accumulation"
-    MANIPULATION = "manipulation"  
-    EXPANSION = "expansion"
-    DISTRIBUTION = "distribution"
-    UNKNOWN = "unknown"
-
-
-class EntryType(Enum):
-    LIQUIDITY_SWEEP = "liquidity_sweep"
-    CHOCH = "choch"  # Change of Character
-    FVG = "fvg"  # Fair Value Gap
-    VWAP_BOUNCE = "vwap_bounce"
-    MOMENTUM = "momentum"
+class TrendDirection(Enum):
+    BULLISH = "bullish"
+    BEARISH = "bearish"
+    RANGING = "ranging"
 
 
 class TradeDirection(Enum):
     LONG = "LONG"
     SHORT = "SHORT"
+
+
+class EntryType(Enum):
+    ORDER_BLOCK = "order_block"
+    LIQUIDITY_SWEEP = "liquidity_sweep"
+    VWAP_PULLBACK = "vwap_pullback"
 
 
 @dataclass
@@ -69,29 +73,21 @@ class Candle:
         return self.close > self.open
     
     @property
-    def mid_price(self) -> float:
-        return (self.high + self.low) / 2
+    def body_pct(self) -> float:
+        if self.total_range == 0:
+            return 0
+        return self.body_size / self.total_range
 
 
 @dataclass
-class LiquidityLevel:
-    price: float
-    level_type: str  # "equal_high" or "equal_low"
-    touches: int
-    first_touch: float
-    last_touch: float
-    swept: bool = False
-    sweep_time: Optional[float] = None
-
-
-@dataclass  
-class FairValueGap:
-    """Fair Value Gap (imbalance zone)"""
-    high: float  # Top of gap
-    low: float   # Bottom of gap
-    direction: str  # "bullish" or "bearish"
+class OrderBlock:
+    """Institutional Order Block - zone where institutions entered"""
+    top: float
+    bottom: float
+    direction: str  # "bullish" (demand) or "bearish" (supply)
     timestamp: float
-    filled: bool = False
+    strength: int = 1  # How many times it's been tested
+    valid: bool = True
 
 
 @dataclass
@@ -104,12 +100,10 @@ class TradeSignal:
     tp1: float
     tp2: float
     tp3: float
-    liquidity_level: Optional[float]
-    sweep_candle_low: float
-    sweep_candle_high: float
     vwap: float
+    trend: TrendDirection
+    rsi: float
     reason: str
-    market_state: MarketState
     
     @property
     def risk_distance(self) -> float:
@@ -117,19 +111,19 @@ class TradeSignal:
     
     @property
     def is_valid(self) -> bool:
-        # Valid risk: 0.05% to 1%
-        return 0.0005 <= self.risk_distance <= 0.01
+        # Valid risk: 0.1% to 0.8% (tighter for scalping)
+        return 0.001 <= self.risk_distance <= 0.008
 
 
 class InstitutionalStrategy:
     """
-    Multi-Position Institutional Strategy
+    High Win-Rate Strategy
     
-    Entry Types (Priority):
-    1. Liquidity Sweep + Reclaim
-    2. Change of Character (CHoCH)
-    3. Fair Value Gap (FVG) Fill
-    4. VWAP Bounce
+    Key Rules:
+    1. ONLY trade with 15M trend
+    2. Wait for pullback to Order Block/VWAP
+    3. RSI must confirm reversal
+    4. Enter on confirmation candle
     """
     
     def __init__(self, max_positions: int = 3):
@@ -138,28 +132,25 @@ class InstitutionalStrategy:
         self.candles_5m: Dict[str, deque] = {}
         self.candles_15m: Dict[str, deque] = {}
         
-        self.liquidity_levels: Dict[str, List[LiquidityLevel]] = {}
-        self.fair_value_gaps: Dict[str, List[FairValueGap]] = {}
+        self.order_blocks: Dict[str, List[OrderBlock]] = {}
         
-        # Market structure tracking
-        self.swing_highs: Dict[str, List[float]] = {}
-        self.swing_lows: Dict[str, List[float]] = {}
-        self.last_structure_break: Dict[str, Optional[str]] = {}  # "bullish" or "bearish"
-        
-        self.session_high: Dict[str, float] = {}
-        self.session_low: Dict[str, float] = {}
-        
+        # Technical indicators
         self.vwap: Dict[str, float] = {}
         self.vwap_data: Dict[str, List[Tuple[float, float]]] = {}
+        self.rsi: Dict[str, float] = {}
+        self.trend: Dict[str, TrendDirection] = {}
+        
+        # Swing points for structure
+        self.swing_highs: Dict[str, List[float]] = {}
+        self.swing_lows: Dict[str, List[float]] = {}
         
         # Configuration
         self.max_positions = max_positions
-        self.equal_level_tolerance = 0.0008
-        self.min_level_touches = 1
-        self.sl_buffer_pct = 0.001
-        self.max_candles_1m = 120
-        self.max_candles_5m = 50
-        self.max_candles_15m = 30
+        self.rsi_period = 14
+        self.rsi_overbought = 70
+        self.rsi_oversold = 30
+        self.sl_buffer_pct = 0.0005  # 0.05% buffer
+        self.max_candles = 100
     
     def get_diagnostics(self, symbol: str) -> Dict:
         """Get diagnostic info for a symbol."""
@@ -168,46 +159,38 @@ class InstitutionalStrategy:
             "candles_1m": len(self.candles_1m.get(symbol, [])),
             "candles_5m": len(self.candles_5m.get(symbol, [])),
             "candles_15m": len(self.candles_15m.get(symbol, [])),
-            "liquidity_levels": [
-                {"price": l.price, "type": l.level_type, "touches": l.touches, "swept": l.swept}
-                for l in self.liquidity_levels.get(symbol, [])[:5]
-            ],
-            "fvg_count": len([f for f in self.fair_value_gaps.get(symbol, []) if not f.filled]),
+            "trend": self.trend.get(symbol, TrendDirection.RANGING).value,
+            "rsi": round(self.rsi.get(symbol, 50), 1),
             "vwap": self.vwap.get(symbol),
-            "market_state": self.get_market_state(symbol).value,
-            "last_structure": self.last_structure_break.get(symbol, "none"),
+            "order_blocks": len([ob for ob in self.order_blocks.get(symbol, []) if ob.valid]),
         }
     
     def add_candle(self, symbol: str, candle: Candle, timeframe: str = "1m"):
         """Add a candle and update all derived data."""
         storage_map = {
-            "1m": (self.candles_1m, self.max_candles_1m),
-            "5m": (self.candles_5m, self.max_candles_5m),
-            "15m": (self.candles_15m, self.max_candles_15m)
+            "1m": self.candles_1m,
+            "5m": self.candles_5m,
+            "15m": self.candles_15m
         }
         
-        storage, max_len = storage_map.get(timeframe, (self.candles_1m, self.max_candles_1m))
+        storage = storage_map.get(timeframe, self.candles_1m)
         
         if symbol not in storage:
-            storage[symbol] = deque(maxlen=max_len)
+            storage[symbol] = deque(maxlen=self.max_candles)
         
         storage[symbol].append(candle)
         
-        # Update session extremes
-        if symbol not in self.session_high or candle.high > self.session_high[symbol]:
-            self.session_high[symbol] = candle.high
-        if symbol not in self.session_low or candle.low < self.session_low[symbol]:
-            self.session_low[symbol] = candle.low
-        
-        # Update VWAP (1m data)
+        # Update indicators based on timeframe
         if timeframe == "1m":
             self._update_vwap(symbol, candle)
-            self._detect_fvg(symbol)
+            self._update_rsi(symbol)
         
-        # Detect structure (5m data)
         if timeframe == "5m":
-            self._detect_liquidity_levels(symbol)
-            self._detect_structure_break(symbol)
+            self._detect_order_blocks(symbol)
+            self._update_swing_points(symbol)
+        
+        if timeframe == "15m":
+            self._update_trend(symbol)
     
     def _update_vwap(self, symbol: str, candle: Candle):
         if symbol not in self.vwap_data:
@@ -225,84 +208,112 @@ class InstitutionalStrategy:
         if total_v > 0:
             self.vwap[symbol] = total_pv / total_v
     
-    def _detect_liquidity_levels(self, symbol: str):
-        """Detect swing highs/lows from 5M candles."""
+    def _update_rsi(self, symbol: str):
+        """Calculate RSI from 1M closes."""
+        candles = list(self.candles_1m.get(symbol, []))
+        if len(candles) < self.rsi_period + 1:
+            self.rsi[symbol] = 50  # Neutral default
+            return
+        
+        closes = [c.close for c in candles[-(self.rsi_period + 1):]]
+        changes = [closes[i] - closes[i-1] for i in range(1, len(closes))]
+        
+        gains = [c if c > 0 else 0 for c in changes]
+        losses = [-c if c < 0 else 0 for c in changes]
+        
+        avg_gain = sum(gains) / self.rsi_period
+        avg_loss = sum(losses) / self.rsi_period
+        
+        if avg_loss == 0:
+            self.rsi[symbol] = 100
+        else:
+            rs = avg_gain / avg_loss
+            self.rsi[symbol] = 100 - (100 / (1 + rs))
+    
+    def _update_trend(self, symbol: str):
+        """Determine trend from 15M candles."""
+        candles = list(self.candles_15m.get(symbol, []))
+        if len(candles) < 10:
+            self.trend[symbol] = TrendDirection.RANGING
+            return
+        
+        recent = candles[-10:]
+        closes = [c.close for c in recent]
+        
+        # Simple: is recent close above/below average?
+        avg = sum(closes) / len(closes)
+        current = closes[-1]
+        
+        # Also check structure: are we making higher lows or lower highs?
+        lows = [c.low for c in recent]
+        highs = [c.high for c in recent]
+        
+        recent_low = min(lows[-3:])
+        older_low = min(lows[:3])
+        recent_high = max(highs[-3:])
+        older_high = max(highs[:3])
+        
+        if current > avg and recent_low > older_low:
+            self.trend[symbol] = TrendDirection.BULLISH
+        elif current < avg and recent_high < older_high:
+            self.trend[symbol] = TrendDirection.BEARISH
+        else:
+            self.trend[symbol] = TrendDirection.RANGING
+    
+    def _detect_order_blocks(self, symbol: str):
+        """Detect Order Blocks from 5M candles."""
         candles = list(self.candles_5m.get(symbol, []))
         if len(candles) < 5:
             return
         
-        if symbol not in self.liquidity_levels:
-            self.liquidity_levels[symbol] = []
+        if symbol not in self.order_blocks:
+            self.order_blocks[symbol] = []
         
-        # Swing detection with 1 candle confirmation
-        for i in range(1, len(candles) - 1):
-            # Swing high
-            if candles[i].high >= candles[i-1].high and candles[i].high >= candles[i+1].high:
-                self._register_level(symbol, candles[i].high, "equal_high", candles[i].timestamp)
+        # Look for strong impulse moves with body > 60%
+        for i in range(2, len(candles) - 1):
+            c = candles[i]
             
-            # Swing low  
-            if candles[i].low <= candles[i-1].low and candles[i].low <= candles[i+1].low:
-                self._register_level(symbol, candles[i].low, "equal_low", candles[i].timestamp)
+            # Bullish Order Block: strong bearish candle followed by bullish move
+            if not c.is_bullish and c.body_pct > 0.6:
+                next_c = candles[i + 1]
+                if next_c.is_bullish and next_c.close > c.open:
+                    # This bearish candle is a demand zone
+                    ob = OrderBlock(
+                        top=c.open,
+                        bottom=c.close,
+                        direction="bullish",
+                        timestamp=c.timestamp
+                    )
+                    self._add_order_block(symbol, ob)
+            
+            # Bearish Order Block: strong bullish candle followed by bearish move
+            if c.is_bullish and c.body_pct > 0.6:
+                next_c = candles[i + 1]
+                if not next_c.is_bullish and next_c.close < c.open:
+                    # This bullish candle is a supply zone
+                    ob = OrderBlock(
+                        top=c.close,
+                        bottom=c.open,
+                        direction="bearish",
+                        timestamp=c.timestamp
+                    )
+                    self._add_order_block(symbol, ob)
     
-    def _register_level(self, symbol: str, price: float, level_type: str, timestamp: float):
-        tolerance = price * self.equal_level_tolerance
-        
-        for level in self.liquidity_levels[symbol]:
-            if level.level_type == level_type and abs(level.price - price) < tolerance:
-                level.touches += 1
-                level.last_touch = timestamp
+    def _add_order_block(self, symbol: str, ob: OrderBlock):
+        """Add order block, avoid duplicates."""
+        for existing in self.order_blocks[symbol]:
+            if abs(existing.top - ob.top) < ob.top * 0.001:
+                existing.strength += 1
                 return
         
-        self.liquidity_levels[symbol].append(LiquidityLevel(
-            price=price, level_type=level_type, touches=1,
-            first_touch=timestamp, last_touch=timestamp
-        ))
-        
-        # Keep top 20 levels
-        self.liquidity_levels[symbol] = sorted(
-            self.liquidity_levels[symbol],
-            key=lambda x: x.touches,
-            reverse=True
-        )[:20]
+        self.order_blocks[symbol].append(ob)
+        # Keep only recent 10 order blocks
+        self.order_blocks[symbol] = self.order_blocks[symbol][-10:]
     
-    def _detect_fvg(self, symbol: str):
-        """Detect Fair Value Gaps from 1M candles."""
-        candles = list(self.candles_1m.get(symbol, []))
-        if len(candles) < 3:
-            return
-        
-        if symbol not in self.fair_value_gaps:
-            self.fair_value_gaps[symbol] = []
-        
-        c1, c2, c3 = candles[-3], candles[-2], candles[-1]
-        
-        # Bullish FVG: c1 high < c3 low (gap up)
-        if c1.high < c3.low:
-            self.fair_value_gaps[symbol].append(FairValueGap(
-                high=c3.low,
-                low=c1.high,
-                direction="bullish",
-                timestamp=c2.timestamp
-            ))
-        
-        # Bearish FVG: c1 low > c3 high (gap down)
-        if c1.low > c3.high:
-            self.fair_value_gaps[symbol].append(FairValueGap(
-                high=c1.low,
-                low=c3.high,
-                direction="bearish",
-                timestamp=c2.timestamp
-            ))
-        
-        # Keep only recent unfilled gaps
-        self.fair_value_gaps[symbol] = [
-            f for f in self.fair_value_gaps[symbol][-10:] if not f.filled
-        ]
-    
-    def _detect_structure_break(self, symbol: str):
-        """Detect Change of Character (CHoCH) from 5M structure."""
+    def _update_swing_points(self, symbol: str):
+        """Track swing highs and lows from 5M."""
         candles = list(self.candles_5m.get(symbol, []))
-        if len(candles) < 10:
+        if len(candles) < 5:
             return
         
         if symbol not in self.swing_highs:
@@ -310,217 +321,146 @@ class InstitutionalStrategy:
         if symbol not in self.swing_lows:
             self.swing_lows[symbol] = []
         
-        # Get recent swing points
-        recent_highs = [c.high for c in candles[-10:]]
-        recent_lows = [c.low for c in candles[-10:]]
+        for i in range(2, len(candles) - 2):
+            # Swing high
+            if candles[i].high > candles[i-1].high and candles[i].high > candles[i+1].high:
+                if candles[i].high not in self.swing_highs[symbol]:
+                    self.swing_highs[symbol].append(candles[i].high)
+            
+            # Swing low
+            if candles[i].low < candles[i-1].low and candles[i].low < candles[i+1].low:
+                if candles[i].low not in self.swing_lows[symbol]:
+                    self.swing_lows[symbol].append(candles[i].low)
         
-        max_high = max(recent_highs)
-        min_low = min(recent_lows)
-        current_close = candles[-1].close
-        prev_close = candles[-2].close
-        
-        # Bullish CHoCH: Price was making lower lows, now breaks a swing high
-        if current_close > max_high * 0.999 and prev_close < max_high:
-            self.last_structure_break[symbol] = "bullish"
-        
-        # Bearish CHoCH: Price was making higher highs, now breaks a swing low
-        elif current_close < min_low * 1.001 and prev_close > min_low:
-            self.last_structure_break[symbol] = "bearish"
-    
-    def get_market_state(self, symbol: str) -> MarketState:
-        """Determine market state - default to expansion for trading."""
-        if symbol not in self.candles_15m or len(self.candles_15m[symbol]) < 5:
-            return MarketState.EXPANSION
-        
-        candles = list(self.candles_15m[symbol])[-10:]
-        avg_volume = np.mean([c.volume for c in candles])
-        recent = candles[-3:]
-        recent_volume = np.mean([c.volume for c in recent])
-        
-        if recent_volume > avg_volume * 1.5:
-            return MarketState.EXPANSION
-        elif recent_volume < avg_volume * 0.5:
-            return MarketState.ACCUMULATION
-        
-        return MarketState.EXPANSION
+        # Keep recent swings only
+        self.swing_highs[symbol] = self.swing_highs[symbol][-10:]
+        self.swing_lows[symbol] = self.swing_lows[symbol][-10:]
     
     def generate_signal(self, symbol: str, current_candle: Candle) -> Optional[TradeSignal]:
         """
-        Generate trading signal using multiple entry types.
-        Priority: Liquidity Sweep > CHoCH > FVG > VWAP Bounce
+        Generate trading signal with HIGH WIN-RATE requirements.
+        
+        ONLY enter when:
+        1. Trend is clear (not ranging)
+        2. Price is at an Order Block
+        3. RSI confirms reversal
+        4. Current candle shows rejection
         """
+        trend = self.trend.get(symbol, TrendDirection.RANGING)
+        rsi = self.rsi.get(symbol, 50)
         vwap = self.vwap.get(symbol)
+        
         if not vwap:
             return None
         
-        # 1. Check Liquidity Sweep (highest priority)
-        signal = self._check_liquidity_sweep(symbol, current_candle)
+        # RULE 1: Don't trade ranging markets
+        if trend == TrendDirection.RANGING:
+            return None
+        
+        # RULE 2: Check for Order Block entry
+        signal = self._check_order_block_entry(symbol, current_candle, trend, rsi)
         if signal:
             return signal
         
-        # 2. Check Change of Character
-        signal = self._check_choch_entry(symbol, current_candle)
-        if signal:
-            return signal
-        
-        # 3. Check FVG Fill
-        signal = self._check_fvg_entry(symbol, current_candle)
-        if signal:
-            return signal
-        
-        # 4. Check VWAP Bounce
-        signal = self._check_vwap_bounce(symbol, current_candle)
+        # RULE 3: Check for VWAP pullback (in trend direction)
+        signal = self._check_vwap_pullback(symbol, current_candle, trend, rsi)
         if signal:
             return signal
         
         return None
     
-    def _check_liquidity_sweep(self, symbol: str, candle: Candle) -> Optional[TradeSignal]:
-        """Check for liquidity sweep + reclaim."""
-        if symbol not in self.liquidity_levels:
-            return None
+    def _check_order_block_entry(self, symbol: str, candle: Candle, 
+                                  trend: TrendDirection, rsi: float) -> Optional[TradeSignal]:
+        """Check if price is at an Order Block with confirmation."""
+        order_blocks = [ob for ob in self.order_blocks.get(symbol, []) if ob.valid]
         
-        for level in self.liquidity_levels[symbol]:
-            if level.swept:
-                continue
+        for ob in order_blocks:
+            ob_mid = (ob.top + ob.bottom) / 2
             
-            # LONG: Sweep below equal low, close back above
-            if level.level_type == "equal_low":
-                if candle.low < level.price and candle.close > level.price:
-                    level.swept = True
-                    return self._create_signal(
-                        symbol, TradeDirection.LONG, EntryType.LIQUIDITY_SWEEP,
-                        candle, level.price, candle.low,
-                        f"Sweep @ ${level.price:,.0f} → Reclaim"
-                    )
-            
-            # SHORT: Sweep above equal high, close back below
-            if level.level_type == "equal_high":
-                if candle.high > level.price and candle.close < level.price:
-                    level.swept = True
-                    return self._create_signal(
-                        symbol, TradeDirection.SHORT, EntryType.LIQUIDITY_SWEEP,
-                        candle, level.price, candle.high,
-                        f"Sweep @ ${level.price:,.0f} → Rejection"
-                    )
-        
-        return None
-    
-    def _check_choch_entry(self, symbol: str, candle: Candle) -> Optional[TradeSignal]:
-        """Check for Change of Character entry."""
-        structure = self.last_structure_break.get(symbol)
-        if not structure:
-            return None
-        
-        vwap = self.vwap.get(symbol, candle.close)
-        candles = list(self.candles_1m.get(symbol, []))
-        if len(candles) < 5:
-            return None
-        
-        recent_low = min(c.low for c in candles[-5:])
-        recent_high = max(c.high for c in candles[-5:])
-        
-        # Bullish CHoCH: Enter on pullback after structure break
-        if structure == "bullish" and candle.is_bullish:
-            if candle.low <= vwap * 1.002 and candle.close > vwap:
-                self.last_structure_break[symbol] = None  # Reset
+            # LONG: Bullish trend + Bullish OB + RSI oversold + Price at OB + Bullish candle
+            if (trend == TrendDirection.BULLISH and 
+                ob.direction == "bullish" and
+                rsi < 40 and  # RSI showing oversold pullback
+                candle.low <= ob.top and candle.close > ob_mid and
+                candle.is_bullish and candle.body_pct > 0.4):
+                
+                ob.valid = False  # Mark as used
                 return self._create_signal(
-                    symbol, TradeDirection.LONG, EntryType.CHOCH,
-                    candle, vwap, recent_low,
-                    f"CHoCH Bullish + VWAP"
+                    symbol, TradeDirection.LONG, EntryType.ORDER_BLOCK,
+                    candle.close, ob.bottom, trend, rsi,
+                    f"Order Block Long @ ${ob_mid:,.0f}"
                 )
-        
-        # Bearish CHoCH
-        if structure == "bearish" and not candle.is_bullish:
-            if candle.high >= vwap * 0.998 and candle.close < vwap:
-                self.last_structure_break[symbol] = None
+            
+            # SHORT: Bearish trend + Bearish OB + RSI overbought + Price at OB + Bearish candle
+            if (trend == TrendDirection.BEARISH and 
+                ob.direction == "bearish" and
+                rsi > 60 and  # RSI showing overbought pullback
+                candle.high >= ob.bottom and candle.close < ob_mid and
+                not candle.is_bullish and candle.body_pct > 0.4):
+                
+                ob.valid = False
                 return self._create_signal(
-                    symbol, TradeDirection.SHORT, EntryType.CHOCH,
-                    candle, vwap, recent_high,
-                    f"CHoCH Bearish + VWAP"
+                    symbol, TradeDirection.SHORT, EntryType.ORDER_BLOCK,
+                    candle.close, ob.top, trend, rsi,
+                    f"Order Block Short @ ${ob_mid:,.0f}"
                 )
         
         return None
     
-    def _check_fvg_entry(self, symbol: str, candle: Candle) -> Optional[TradeSignal]:
-        """Check for Fair Value Gap fill entry."""
-        gaps = self.fair_value_gaps.get(symbol, [])
-        if not gaps:
-            return None
-        
-        for gap in gaps:
-            if gap.filled:
-                continue
-            
-            gap_mid = (gap.high + gap.low) / 2
-            
-            # Bullish FVG: Price returns to fill, bounces
-            if gap.direction == "bullish":
-                if candle.low <= gap_mid and candle.close > gap_mid:
-                    gap.filled = True
-                    return self._create_signal(
-                        symbol, TradeDirection.LONG, EntryType.FVG,
-                        candle, gap_mid, gap.low,
-                        f"FVG Fill @ ${gap_mid:,.0f}"
-                    )
-            
-            # Bearish FVG
-            if gap.direction == "bearish":
-                if candle.high >= gap_mid and candle.close < gap_mid:
-                    gap.filled = True
-                    return self._create_signal(
-                        symbol, TradeDirection.SHORT, EntryType.FVG,
-                        candle, gap_mid, gap.high,
-                        f"FVG Fill @ ${gap_mid:,.0f}"
-                    )
-        
-        return None
-    
-    def _check_vwap_bounce(self, symbol: str, candle: Candle) -> Optional[TradeSignal]:
-        """Check for VWAP bounce entry."""
+    def _check_vwap_pullback(self, symbol: str, candle: Candle,
+                              trend: TrendDirection, rsi: float) -> Optional[TradeSignal]:
+        """VWAP pullback in trend direction."""
         vwap = self.vwap.get(symbol)
         if not vwap:
             return None
         
         price = candle.close
-        vwap_dist = abs(price - vwap) / vwap
+        vwap_dist = (price - vwap) / vwap
         
-        # Within 0.1% of VWAP
-        if vwap_dist < 0.001:
-            if candle.is_bullish and candle.body_size > candle.total_range * 0.5:
-                return self._create_signal(
-                    symbol, TradeDirection.LONG, EntryType.VWAP_BOUNCE,
-                    candle, vwap, candle.low,
-                    f"VWAP Bounce @ ${vwap:,.0f}"
-                )
-            elif not candle.is_bullish and candle.body_size > candle.total_range * 0.5:
-                return self._create_signal(
-                    symbol, TradeDirection.SHORT, EntryType.VWAP_BOUNCE,
-                    candle, vwap, candle.high,
-                    f"VWAP Rejection @ ${vwap:,.0f}"
-                )
+        # LONG: Bullish trend + pullback to VWAP + RSI recovering from oversold + bullish candle
+        if (trend == TrendDirection.BULLISH and
+            abs(vwap_dist) < 0.002 and  # Within 0.2% of VWAP
+            30 < rsi < 45 and  # RSI recovering from oversold
+            candle.is_bullish and candle.body_pct > 0.5):
+            
+            sl = min(candle.low, vwap) * (1 - self.sl_buffer_pct)
+            return self._create_signal(
+                symbol, TradeDirection.LONG, EntryType.VWAP_PULLBACK,
+                candle.close, sl, trend, rsi,
+                f"VWAP Pullback Long"
+            )
+        
+        # SHORT: Bearish trend + pullback to VWAP + RSI dropping from overbought + bearish candle
+        if (trend == TrendDirection.BEARISH and
+            abs(vwap_dist) < 0.002 and
+            55 < rsi < 70 and
+            not candle.is_bullish and candle.body_pct > 0.5):
+            
+            sl = max(candle.high, vwap) * (1 + self.sl_buffer_pct)
+            return self._create_signal(
+                symbol, TradeDirection.SHORT, EntryType.VWAP_PULLBACK,
+                candle.close, sl, trend, rsi,
+                f"VWAP Pullback Short"
+            )
         
         return None
     
     def _create_signal(self, symbol: str, direction: TradeDirection,
-                       entry_type: EntryType, candle: Candle, 
-                       level: float, wick: float, reason: str) -> Optional[TradeSignal]:
-        """Create a validated trade signal."""
-        entry = candle.close
+                       entry_type: EntryType, entry: float, sl: float,
+                       trend: TrendDirection, rsi: float, reason: str) -> Optional[TradeSignal]:
+        """Create a validated trade signal with proper R:R."""
         vwap = self.vwap.get(symbol, entry)
         
+        risk = abs(entry - sl)
+        
         if direction == TradeDirection.LONG:
-            sl = wick * (1 - self.sl_buffer_pct)
-            risk = entry - sl
-            tp1 = entry + risk * 1.0
-            tp2 = entry + risk * 2.0
-            tp3 = entry + risk * 3.0
+            tp1 = entry + risk * 1.5  # 1.5R
+            tp2 = entry + risk * 2.5  # 2.5R
+            tp3 = entry + risk * 4.0  # 4R
         else:
-            sl = wick * (1 + self.sl_buffer_pct)
-            risk = sl - entry
-            tp1 = entry - risk * 1.0
-            tp2 = entry - risk * 2.0
-            tp3 = entry - risk * 3.0
+            tp1 = entry - risk * 1.5
+            tp2 = entry - risk * 2.5
+            tp3 = entry - risk * 4.0
         
         signal = TradeSignal(
             symbol=symbol,
@@ -531,12 +471,10 @@ class InstitutionalStrategy:
             tp1=tp1,
             tp2=tp2,
             tp3=tp3,
-            liquidity_level=level,
-            sweep_candle_low=candle.low,
-            sweep_candle_high=candle.high,
             vwap=vwap,
-            reason=reason,
-            market_state=self.get_market_state(symbol)
+            trend=trend,
+            rsi=rsi,
+            reason=reason
         )
         
         if signal.is_valid:
