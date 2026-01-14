@@ -59,7 +59,7 @@ interface TradeState {
     prices: Record<string, number>
 
     // Trades
-    activeTrade: ActiveTrade | null
+    activePositions: Record<string, ActiveTrade>  // Dict by symbol
     trades: Trade[]
 
     // Metrics
@@ -74,10 +74,13 @@ interface TradeState {
     setBalance: (balance: number) => void
     setDailyPnl: (pnl: number, pct: number) => void
     updatePrice: (symbol: string, price: number) => void
-    setActiveTrade: (trade: ActiveTrade | null) => void
+    addActivePosition: (symbol: string, trade: ActiveTrade) => void
+    removeActivePosition: (symbol: string) => void
+    setActiveTrade: (trade: ActiveTrade | null) => void  // Legacy support
     setTrades: (trades: Trade[]) => void
     addTrade: (trade: Trade) => void
     setMetrics: (metrics: Metrics) => void
+    recalculateMetrics: () => void
     addExplanationLog: (log: string) => void
     setHalted: (halted: boolean, reason?: string) => void
     updateFromStatus: (data: any) => void
@@ -102,7 +105,7 @@ export const useTradeStore = create<TradeState>((set, get) => ({
     isHalted: false,
     haltReason: null,
     prices: {},
-    activeTrade: null,
+    activePositions: {},
     trades: [],
     metrics: {
         total_trades: 0,
@@ -122,27 +125,80 @@ export const useTradeStore = create<TradeState>((set, get) => ({
     setBalance: (balance) => set({ balance }),
     setDailyPnl: (pnl, pct) => set({ dailyPnl: pnl, dailyPnlPct: pct }),
 
-    updatePrice: (symbol, price) => set((state) => ({
-        prices: { ...state.prices, [symbol]: price },
-        // Update active trade current price if matching
-        activeTrade: state.activeTrade?.symbol === symbol
-            ? {
-                ...state.activeTrade,
+    updatePrice: (symbol, price) => set((state) => {
+        const newPositions = { ...state.activePositions }
+        if (newPositions[symbol]) {
+            const pos = newPositions[symbol]
+            const pnl = pos.direction === 'LONG'
+                ? (price - pos.entry_price)
+                : (pos.entry_price - price)
+            newPositions[symbol] = {
+                ...pos,
                 current_price: price,
-                unrealized_pnl: state.activeTrade.direction === 'LONG'
-                    ? (price - state.activeTrade.entry_price) * 1 // Simplified
-                    : (state.activeTrade.entry_price - price) * 1,
+                unrealized_pnl: pnl,
+                unrealized_pnl_pct: (pnl / pos.entry_price) * 100
             }
-            : state.activeTrade,
+        }
+        return { prices: { ...state.prices, [symbol]: price }, activePositions: newPositions }
+    }),
+
+    addActivePosition: (symbol, trade) => set((state) => ({
+        activePositions: { ...state.activePositions, [symbol]: trade }
     })),
 
-    setActiveTrade: (trade) => set({ activeTrade: trade }),
-    setTrades: (trades) => set({ trades }),
-    addTrade: (trade) => set((state) => ({ trades: [trade, ...state.trades] })),
+    removeActivePosition: (symbol) => set((state) => {
+        const newPositions = { ...state.activePositions }
+        delete newPositions[symbol]
+        return { activePositions: newPositions }
+    }),
+
+    // Legacy support for single trade
+    setActiveTrade: (trade) => set((state) => {
+        if (trade === null) {
+            return { activePositions: {} }
+        }
+        return { activePositions: { [trade.symbol]: trade } }
+    }),
+
+    setTrades: (trades) => {
+        set({ trades })
+        get().recalculateMetrics()
+    },
+
+    addTrade: (trade) => {
+        set((state) => ({ trades: [trade, ...state.trades] }))
+        get().recalculateMetrics()
+    },
+
     setMetrics: (metrics) => set({ metrics }),
 
+    recalculateMetrics: () => set((state) => {
+        const trades = state.trades.filter(t => t.status === 'closed')
+        const wins = trades.filter(t => t.result === 'WIN').length
+        const losses = trades.filter(t => t.result === 'LOSS').length
+        const total = wins + losses
+        const totalPnl = trades.reduce((sum, t) => sum + (t.pnl_usd || 0), 0)
+
+        const winPnl = trades.filter(t => t.result === 'WIN').reduce((sum, t) => sum + (t.pnl_usd || 0), 0)
+        const lossPnl = Math.abs(trades.filter(t => t.result === 'LOSS').reduce((sum, t) => sum + (t.pnl_usd || 0), 0))
+
+        return {
+            metrics: {
+                total_trades: total,
+                wins,
+                losses,
+                win_rate: total > 0 ? (wins / total) * 100 : 0,
+                profit_factor: lossPnl > 0 ? winPnl / lossPnl : winPnl > 0 ? Infinity : 0,
+                avg_rr: 1.5, // Placeholder
+                total_pnl: totalPnl,
+                max_drawdown: 0  // Placeholder
+            },
+            dailyPnl: totalPnl
+        }
+    }),
+
     addExplanationLog: (log) => set((state) => ({
-        explanationLogs: [log, ...state.explanationLogs].slice(0, 50), // Keep last 50
+        explanationLogs: [log, ...state.explanationLogs].slice(0, 50),
     })),
 
     setHalted: (halted, reason) => set({
@@ -185,27 +241,25 @@ export const useTradeStore = create<TradeState>((set, get) => ({
                 get().updateFromStatus(statusData)
             }
 
-            // Fetch trades
-            const tradesRes = await fetch(`${API_URL}/api/trades?limit=50`)
+            // Fetch trades from backend (now includes metrics)
+            const tradesRes = await fetch(`${API_URL}/api/trades`)
             if (tradesRes.ok) {
-                const tradesData = await tradesRes.json()
-                set({ trades: tradesData })
+                const data = await tradesRes.json()
+                set({
+                    trades: data.trades || [],
+                    tradesToday: data.trades_today || 0,
+                    lossesToday: data.losses_today || 0,
+                    currentStreak: data.streak || 0,
+                    dailyPnl: data.daily_pnl || 0
+                })
+                get().recalculateMetrics()
             }
 
-            // Fetch metrics
+            // Fetch metrics (may override calculated)
             const metricsRes = await fetch(`${API_URL}/api/metrics`)
             if (metricsRes.ok) {
                 const metricsData = await metricsRes.json()
                 set({ metrics: metricsData })
-            }
-
-            // Fetch active trade
-            const activeRes = await fetch(`${API_URL}/api/active-trade`)
-            if (activeRes.ok) {
-                const activeData = await activeRes.json()
-                if (activeData.active) {
-                    set({ activeTrade: activeData.trade })
-                }
             }
         } catch (error) {
             console.error('Failed to fetch initial data:', error)

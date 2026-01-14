@@ -12,7 +12,8 @@ export function useWebSocket() {
     const {
         updateFromStatus,
         updatePrice,
-        setActiveTrade,
+        addActivePosition,
+        removeActivePosition,
         addTrade,
         addExplanationLog,
         setHalted,
@@ -103,7 +104,7 @@ export function useWebSocket() {
             case 'trade':
                 if (data) {
                     if (data.event === 'close') {
-                        // Trade closed - add to history and clear active
+                        // Trade closed - add to history and remove from active
                         addTrade({
                             id: Date.now().toString(),
                             symbol: data.symbol,
@@ -119,17 +120,17 @@ export function useWebSocket() {
                             market_state: 'expansion',
                             entry_logic: data.reason || ''
                         })
-                        setActiveTrade(null)
-                        addExplanationLog(`${data.result === 'WIN' ? '🟢' : '🔴'} Trade closed: ${data.symbol} | ${data.result} | $${data.pnl_usd?.toFixed(2) || 0}`)
+                        removeActivePosition(data.symbol)
+                        addExplanationLog(`${data.result === 'WIN' ? '🟢' : '🔴'} ${data.symbol} closed | ${data.result} | $${data.pnl_usd?.toFixed(2) || 0}`)
                     } else {
-                        // Trade opened
-                        setActiveTrade({
+                        // Trade opened - add to active positions
+                        addActivePosition(data.symbol, {
                             symbol: data.symbol,
                             direction: data.direction,
                             entry_price: data.entry,
                             stop_loss: data.sl,
                         })
-                        addExplanationLog(`✅ Trade opened: ${data.direction} ${data.symbol} @ $${data.entry}`)
+                        addExplanationLog(`✅ ${data.direction} ${data.symbol} @ $${data.entry?.toLocaleString()}`)
                     }
                 }
                 break
@@ -149,7 +150,7 @@ export function useWebSocket() {
                 // Ignore unknown message types silently
                 break
         }
-    }, [updateFromStatus, updatePrice, setActiveTrade, addTrade, addExplanationLog, setHalted])
+    }, [updateFromStatus, updatePrice, addActivePosition, removeActivePosition, addTrade, addExplanationLog, setHalted])
 
     // Heartbeat
     useEffect(() => {
