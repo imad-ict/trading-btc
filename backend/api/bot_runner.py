@@ -1,8 +1,12 @@
 """
-Bot Runner - Trading bot with strategy execution.
+Bot Runner - Institutional Trading Bot
 
-Runs as a background task within the API server.
-Implements a simple momentum-based strategy for demonstration.
+Implements liquidity-based strategy:
+- NO momentum entries
+- Only liquidity sweep + reclaim
+- Structure-based SL (behind wick)
+- Multi-target TP with partial closes
+- Dynamic SL movement
 """
 import asyncio
 import logging
@@ -11,122 +15,61 @@ import hashlib
 import time
 from decimal import Decimal
 from typing import Dict, Optional, List
-from collections import deque
 from datetime import datetime
 import httpx
 import websockets
 import json
 
+from strategy.institutional_strategy import (
+    InstitutionalStrategy, TradeSignal, ActivePosition, 
+    Candle, TradeDirection, MarketState
+)
+
 logger = logging.getLogger(__name__)
-
-
-class TradingStrategy:
-    """
-    Simple momentum-based trading strategy.
-    
-    Entry Logic:
-    - Tracks price changes over a rolling window
-    - Enters LONG when price momentum is positive and exceeds threshold
-    - Enters SHORT when price momentum is negative and exceeds threshold
-    
-    Exit Logic:
-    - Stop-loss at configured percentage
-    - Take-profit at configured R:R ratio
-    """
-    
-    def __init__(self, risk_pct: float = 0.5, rr_ratio: float = 2.0):
-        self.risk_pct = risk_pct  # Risk per trade (0.5%)
-        self.rr_ratio = rr_ratio  # Risk-reward ratio (2:1)
-        self.price_history: Dict[str, deque] = {}
-        self.window_size = 60  # 60 seconds of price history
-        self.momentum_threshold = 0.001  # 0.1% momentum threshold
-        
-    def add_price(self, symbol: str, price: float) -> None:
-        """Add a price point to history."""
-        if symbol not in self.price_history:
-            self.price_history[symbol] = deque(maxlen=self.window_size)
-        self.price_history[symbol].append({
-            "price": price,
-            "time": time.time()
-        })
-    
-    def get_signal(self, symbol: str) -> Optional[Dict]:
-        """
-        Analyze price data and generate trading signal.
-        
-        Returns:
-            Dict with signal details or None if no signal
-        """
-        if symbol not in self.price_history:
-            return None
-        
-        history = self.price_history[symbol]
-        if len(history) < 30:  # Need at least 30 seconds of data
-            return None
-        
-        # Calculate momentum (price change over window)
-        current_price = history[-1]["price"]
-        oldest_price = history[0]["price"]
-        momentum = (current_price - oldest_price) / oldest_price
-        
-        # Generate signal based on momentum
-        if abs(momentum) > self.momentum_threshold:
-            direction = "LONG" if momentum > 0 else "SHORT"
-            
-            # Calculate stop-loss and take-profit
-            stop_distance = current_price * (self.risk_pct / 100)
-            
-            if direction == "LONG":
-                stop_loss = current_price - stop_distance
-                take_profit = current_price + (stop_distance * self.rr_ratio)
-            else:
-                stop_loss = current_price + stop_distance
-                take_profit = current_price - (stop_distance * self.rr_ratio)
-            
-            return {
-                "symbol": symbol,
-                "direction": direction,
-                "entry_price": current_price,
-                "stop_loss": stop_loss,
-                "take_profit": take_profit,
-                "momentum": momentum,
-                "reason": f"Momentum: {momentum*100:.3f}% ({direction})"
-            }
-        
-        return None
 
 
 class BotRunner:
     """
-    Trading bot that runs within the API server.
+    Institutional Trading Bot.
     
-    Features:
-    - Real-time price streaming from Binance WebSocket
-    - Strategy execution with entry signals
-    - Order execution on Binance Futures
-    - Position management
+    Core Principles:
+    1. NO MOMENTUM - Only liquidity sweeps
+    2. Capital preservation > Trade frequency
+    3. Every trade must be explainable
     """
     
     def __init__(self):
         self.is_running = False
         self.settings: Dict = {}
         self.prices: Dict[str, float] = {}
+        
+        # Tasks
         self.ws_task: Optional[asyncio.Task] = None
         self.strategy_task: Optional[asyncio.Task] = None
+        self.kline_task: Optional[asyncio.Task] = None
+        
+        # Callbacks
         self._price_callback = None
         self._status_callback = None
         self._trade_callback = None
         self._log_callback = None
         
+        # Strategy
+        self.strategy = InstitutionalStrategy()
+        self.active_position: Optional[ActivePosition] = None
+        
         # Trading state
-        self.strategy = TradingStrategy()
-        self.active_position: Optional[Dict] = None
         self.trades_today = 0
         self.max_trades_per_day = 10
         self.last_signal_time: Dict[str, float] = {}
-        self.signal_cooldown = 300  # 5 minutes between signals per symbol
+        self.signal_cooldown = 300  # 5 minutes
+        
+        # Candle aggregation
+        self.current_candle: Dict[str, Dict] = {}
+        self.candle_start_time: Dict[str, float] = {}
     
-    def set_callbacks(self, price_callback, status_callback, trade_callback=None, log_callback=None):
+    def set_callbacks(self, price_callback, status_callback, 
+                      trade_callback=None, log_callback=None):
         """Set callbacks for updates."""
         self._price_callback = price_callback
         self._status_callback = status_callback
@@ -137,10 +80,10 @@ class BotRunner:
         """Log to both logger and callback."""
         logger.info(message)
         if self._log_callback:
-            self._log_callback(message)
+            self._log_callback(f"[{datetime.utcnow().strftime('%H:%M:%S')}] {message}")
     
     async def start(self, settings: Dict) -> bool:
-        """Start the trading bot."""
+        """Start the institutional trading bot."""
         if self.is_running:
             return False
         
@@ -148,13 +91,15 @@ class BotRunner:
         self.is_running = True
         self.trades_today = 0
         
-        # Start price streaming
+        # Start tasks
         self.ws_task = asyncio.create_task(self._stream_prices())
-        
-        # Start strategy loop
+        self.kline_task = asyncio.create_task(self._stream_klines())
         self.strategy_task = asyncio.create_task(self._strategy_loop())
         
-        self._log(f"🚀 Bot started with symbols: {settings.get('symbols', [])}")
+        self._log(f"🚀 INSTITUTIONAL BOT STARTED")
+        self._log(f"📊 Monitoring: {settings.get('symbols', [])}")
+        self._log(f"⚠️ Mode: {settings.get('mode', 'testnet').upper()}")
+        self._log(f"🎯 Strategy: Liquidity Sweep + Reclaim ONLY")
         
         if self._status_callback:
             self._status_callback("running")
@@ -162,26 +107,20 @@ class BotRunner:
         return True
     
     async def stop(self) -> bool:
-        """Stop the trading bot."""
+        """Stop the bot."""
         if not self.is_running:
             return False
         
         self.is_running = False
         
         # Cancel tasks
-        if self.ws_task:
-            self.ws_task.cancel()
-            try:
-                await self.ws_task
-            except asyncio.CancelledError:
-                pass
-        
-        if self.strategy_task:
-            self.strategy_task.cancel()
-            try:
-                await self.strategy_task
-            except asyncio.CancelledError:
-                pass
+        for task in [self.ws_task, self.kline_task, self.strategy_task]:
+            if task:
+                task.cancel()
+                try:
+                    await task
+                except asyncio.CancelledError:
+                    pass
         
         self._log("🛑 Bot stopped")
         
@@ -191,24 +130,22 @@ class BotRunner:
         return True
     
     async def _stream_prices(self):
-        """Stream real-time prices from Binance WebSocket."""
+        """Stream real-time mark prices."""
         symbols = self.settings.get("symbols", ["BTCUSDT", "ETHUSDT", "SOLUSDT"])
         mode = self.settings.get("mode", "testnet")
         
-        # Binance WebSocket URL
         if mode == "testnet":
             ws_base = "wss://stream.binancefuture.com/ws"
         else:
             ws_base = "wss://fstream.binance.com/ws"
         
-        # Build stream names
         streams = [f"{s.lower()}@markPrice@1s" for s in symbols]
         ws_url = f"{ws_base}/{'/'.join(streams)}"
         
         while self.is_running:
             try:
                 async with websockets.connect(ws_url) as ws:
-                    self._log(f"📡 Connected to Binance WebSocket: {len(symbols)} streams")
+                    self._log(f"📡 Price stream connected: {len(symbols)} symbols")
                     
                     while self.is_running:
                         try:
@@ -220,10 +157,9 @@ class BotRunner:
                                 price = float(data["p"])
                                 self.prices[symbol] = price
                                 
-                                # Add to strategy price history
-                                self.strategy.add_price(symbol, price)
+                                # Aggregate into candles
+                                self._aggregate_candle(symbol, price, float(data.get("r", 0)))
                                 
-                                # Callback to update API state
                                 if self._price_callback:
                                     self._price_callback(symbol, price)
                         
@@ -237,47 +173,159 @@ class BotRunner:
                 if self.is_running:
                     await asyncio.sleep(5)
     
-    async def _strategy_loop(self):
-        """Main strategy execution loop."""
-        self._log("📊 Strategy loop started - analyzing market...")
+    async def _stream_klines(self):
+        """Stream 5-minute klines for liquidity detection."""
+        symbols = self.settings.get("symbols", ["BTCUSDT", "ETHUSDT", "SOLUSDT"])
+        mode = self.settings.get("mode", "testnet")
+        
+        if mode == "testnet":
+            ws_base = "wss://stream.binancefuture.com/ws"
+        else:
+            ws_base = "wss://fstream.binance.com/ws"
+        
+        # 5-minute klines for liquidity structure
+        streams = [f"{s.lower()}@kline_5m" for s in symbols]
+        ws_url = f"{ws_base}/{'/'.join(streams)}"
         
         while self.is_running:
             try:
-                # Check every 5 seconds
+                async with websockets.connect(ws_url) as ws:
+                    self._log(f"📊 5M Kline stream connected")
+                    
+                    while self.is_running:
+                        try:
+                            msg = await asyncio.wait_for(ws.recv(), timeout=60)
+                            data = json.loads(msg)
+                            
+                            if "k" in data:
+                                k = data["k"]
+                                if k["x"]:  # Candle closed
+                                    candle = Candle(
+                                        timestamp=k["t"] / 1000,
+                                        open=float(k["o"]),
+                                        high=float(k["h"]),
+                                        low=float(k["l"]),
+                                        close=float(k["c"]),
+                                        volume=float(k["v"])
+                                    )
+                                    self.strategy.add_candle(k["s"], candle, "5m")
+                        
+                        except asyncio.TimeoutError:
+                            await ws.ping()
+                        
+            except asyncio.CancelledError:
+                break
+            except Exception as e:
+                logger.error(f"Kline WebSocket error: {e}")
+                if self.is_running:
+                    await asyncio.sleep(5)
+    
+    def _aggregate_candle(self, symbol: str, price: float, volume: float):
+        """Aggregate tick data into 1-minute candles."""
+        current_minute = int(time.time() / 60) * 60
+        
+        if symbol not in self.current_candle:
+            self.current_candle[symbol] = {
+                "open": price, "high": price, "low": price, 
+                "close": price, "volume": volume
+            }
+            self.candle_start_time[symbol] = current_minute
+            return
+        
+        # Check if new candle
+        if current_minute > self.candle_start_time.get(symbol, 0):
+            # Close previous candle
+            c = self.current_candle[symbol]
+            candle = Candle(
+                timestamp=self.candle_start_time[symbol],
+                open=c["open"], high=c["high"], low=c["low"],
+                close=c["close"], volume=c["volume"]
+            )
+            self.strategy.add_candle(symbol, candle, "1m")
+            
+            # Start new candle
+            self.current_candle[symbol] = {
+                "open": price, "high": price, "low": price,
+                "close": price, "volume": volume
+            }
+            self.candle_start_time[symbol] = current_minute
+        else:
+            # Update current candle
+            self.current_candle[symbol]["high"] = max(self.current_candle[symbol]["high"], price)
+            self.current_candle[symbol]["low"] = min(self.current_candle[symbol]["low"], price)
+            self.current_candle[symbol]["close"] = price
+            self.current_candle[symbol]["volume"] += volume
+    
+    async def _strategy_loop(self):
+        """Main strategy execution loop."""
+        self._log("📊 Strategy loop started")
+        self._log("⏳ Collecting price data for liquidity mapping...")
+        
+        # Wait for initial data collection
+        await asyncio.sleep(60)
+        self._log("📈 Data collection complete - Monitoring for signals")
+        
+        while self.is_running:
+            try:
                 await asyncio.sleep(5)
                 
                 if not self.prices:
                     continue
                 
-                # Check if we have an active position
+                # Check active position
                 if self.active_position:
-                    await self._check_position()
+                    await self._manage_position()
                     continue
                 
                 # Check trade limits
                 if self.trades_today >= self.max_trades_per_day:
                     continue
                 
-                # Look for entry signals
+                # Check market state
                 for symbol in self.prices.keys():
-                    # Check cooldown
-                    last_signal = self.last_signal_time.get(symbol, 0)
-                    if time.time() - last_signal < self.signal_cooldown:
+                    market_state = self.strategy.get_market_state(symbol)
+                    
+                    if market_state not in [MarketState.EXPANSION, MarketState.MANIPULATION]:
                         continue
                     
-                    signal = self.strategy.get_signal(symbol)
+                    # Check cooldown
+                    if time.time() - self.last_signal_time.get(symbol, 0) < self.signal_cooldown:
+                        continue
                     
-                    if signal:
-                        self._log(f"📈 Signal: {signal['direction']} {symbol} @ ${signal['entry_price']:,.2f}")
-                        self._log(f"   Reason: {signal['reason']}")
-                        self._log(f"   SL: ${signal['stop_loss']:,.2f} | TP: ${signal['take_profit']:,.2f}")
+                    # Build current candle for signal check
+                    if symbol in self.current_candle:
+                        c = self.current_candle[symbol]
+                        current = Candle(
+                            timestamp=time.time(),
+                            open=c["open"], high=c["high"], low=c["low"],
+                            close=self.prices[symbol], volume=c["volume"]
+                        )
                         
-                        # Execute trade
-                        success = await self._execute_trade(signal)
+                        # Generate signal
+                        signal = self.strategy.generate_signal(symbol, current)
                         
-                        if success:
-                            self.last_signal_time[symbol] = time.time()
-                            break  # Only one trade at a time
+                        if signal:
+                            self._log(f"")
+                            self._log(f"{'='*50}")
+                            self._log(f"🎯 INSTITUTIONAL SIGNAL DETECTED")
+                            self._log(f"{'='*50}")
+                            self._log(f"Symbol: {signal.symbol}")
+                            self._log(f"Direction: {signal.direction.value}")
+                            self._log(f"Entry: ${signal.entry_price:,.2f}")
+                            self._log(f"Stop Loss: ${signal.stop_loss:,.2f}")
+                            self._log(f"TP1 (VWAP): ${signal.tp1:,.2f}")
+                            self._log(f"TP2 (Liq): ${signal.tp2:,.2f}")
+                            self._log(f"TP3 (Ext): ${signal.tp3:,.2f}")
+                            self._log(f"Reason: {signal.reason}")
+                            self._log(f"Market State: {signal.market_state.value}")
+                            self._log(f"Risk: {signal.risk_distance*100:.3f}%")
+                            self._log(f"{'='*50}")
+                            
+                            success = await self._execute_trade(signal)
+                            
+                            if success:
+                                self.last_signal_time[symbol] = time.time()
+                                break
                 
             except asyncio.CancelledError:
                 break
@@ -285,36 +333,45 @@ class BotRunner:
                 logger.error(f"Strategy error: {e}")
                 await asyncio.sleep(5)
     
-    async def _check_position(self):
-        """Check and manage active position."""
+    async def _manage_position(self):
+        """Manage active position with dynamic SL and partial closes."""
         if not self.active_position:
             return
         
-        symbol = self.active_position["symbol"]
+        pos = self.active_position
+        symbol = pos.signal.symbol
         current_price = self.prices.get(symbol)
         
         if not current_price:
             return
         
-        entry = self.active_position["entry_price"]
-        sl = self.active_position["stop_loss"]
-        tp = self.active_position["take_profit"]
-        direction = self.active_position["direction"]
+        # Check for exit
+        should_exit, reason = pos.should_exit(current_price)
+        if should_exit:
+            await self._close_full_position(reason, current_price)
+            return
         
-        # Check for stop-loss or take-profit
-        if direction == "LONG":
-            if current_price <= sl:
-                await self._close_position("STOP_LOSS", current_price)
-            elif current_price >= tp:
-                await self._close_position("TAKE_PROFIT", current_price)
-        else:  # SHORT
-            if current_price >= sl:
-                await self._close_position("STOP_LOSS", current_price)
-            elif current_price <= tp:
-                await self._close_position("TAKE_PROFIT", current_price)
+        # Check TP levels
+        tp_hit = pos.check_tp_levels(current_price)
+        
+        if tp_hit == "TP1" and not pos.tp1_hit:
+            self._log(f"🎯 TP1 HIT @ ${current_price:,.2f}")
+            await self._partial_close(pos.get_partial_qty_tp1(), "TP1", current_price)
+            pos.move_sl_to_breakeven()
+            self._log(f"📍 SL moved to breakeven: ${pos.current_sl:,.2f}")
+        
+        elif tp_hit == "TP2" and not pos.tp2_hit:
+            self._log(f"🎯 TP2 HIT @ ${current_price:,.2f}")
+            await self._partial_close(pos.get_partial_qty_tp2(), "TP2", current_price)
+            pos.move_sl_to_tp1()
+            self._log(f"📍 SL moved to TP1: ${pos.current_sl:,.2f}")
+        
+        elif tp_hit == "TP3":
+            self._log(f"🎯 TP3 HIT - Full exit @ ${current_price:,.2f}")
+            await self._close_full_position("FULL_TP", current_price)
     
-    async def _execute_trade(self, signal: Dict) -> bool:
-        """Execute a trade on Binance."""
+    async def _execute_trade(self, signal: TradeSignal) -> bool:
+        """Execute trade on Binance Futures."""
         mode = self.settings.get("mode", "testnet")
         api_key = self.settings.get(f"{mode}_api_key", "")
         api_secret = self.settings.get(f"{mode}_api_secret", "")
@@ -329,26 +386,37 @@ class BotRunner:
             base_url = "https://fapi.binance.com"
         
         try:
-            # Calculate position size (simplified - 0.001 BTC for demo)
-            quantity = 0.001 if "BTC" in signal["symbol"] else 0.01
+            # Calculate position size based on risk
+            balance = await self.get_balance()
+            if not balance or balance < 100:
+                self._log(f"❌ Insufficient balance: ${balance}")
+                return False
             
-            # Create order
-            side = "BUY" if signal["direction"] == "LONG" else "SELL"
+            risk_amount = balance * 0.003  # 0.3% risk per trade
+            risk_per_unit = abs(signal.entry_price - signal.stop_loss)
+            quantity = round(risk_amount / risk_per_unit, 3)
             
+            # Minimum quantity check
+            if "BTC" in signal.symbol:
+                quantity = max(0.001, quantity)
+            else:
+                quantity = max(0.01, quantity)
+            
+            side = "BUY" if signal.direction == TradeDirection.LONG else "SELL"
+            
+            # Market order
             timestamp = int(time.time() * 1000)
             params = {
-                "symbol": signal["symbol"],
+                "symbol": signal.symbol,
                 "side": side,
                 "type": "MARKET",
                 "quantity": quantity,
-                "timestamp": timestamp, 
+                "timestamp": timestamp,
             }
             
             query_string = "&".join([f"{k}={v}" for k, v in params.items()])
             signature = hmac.new(
-                api_secret.encode(),
-                query_string.encode(),
-                hashlib.sha256
+                api_secret.encode(), query_string.encode(), hashlib.sha256
             ).hexdigest()
             params["signature"] = signature
             
@@ -361,19 +429,25 @@ class BotRunner:
                 
                 if response.status_code == 200:
                     order = response.json()
-                    self._log(f"✅ Order executed: {side} {quantity} {signal['symbol']}")
+                    self._log(f"✅ ORDER EXECUTED: {side} {quantity} {signal.symbol}")
                     
-                    # Track position
-                    self.active_position = {
-                        **signal,
-                        "order_id": order.get("orderId"),
-                        "quantity": quantity,
-                        "entry_time": datetime.utcnow().isoformat(),
-                    }
+                    self.active_position = ActivePosition(
+                        signal=signal,
+                        order_id=str(order.get("orderId", "")),
+                        quantity=quantity,
+                        entry_time=datetime.utcnow()
+                    )
                     self.trades_today += 1
                     
                     if self._trade_callback:
-                        self._trade_callback(self.active_position)
+                        self._trade_callback({
+                            "symbol": signal.symbol,
+                            "direction": signal.direction.value,
+                            "entry": signal.entry_price,
+                            "sl": signal.stop_loss,
+                            "tp1": signal.tp1,
+                            "quantity": quantity
+                        })
                     
                     return True
                 else:
@@ -385,11 +459,12 @@ class BotRunner:
             self._log(f"❌ Trade execution error: {e}")
             return False
     
-    async def _close_position(self, reason: str, exit_price: float):
-        """Close the active position."""
+    async def _partial_close(self, quantity: float, reason: str, exit_price: float):
+        """Close partial position."""
         if not self.active_position:
             return
         
+        pos = self.active_position
         mode = self.settings.get("mode", "testnet")
         api_key = self.settings.get(f"{mode}_api_key", "")
         api_secret = self.settings.get(f"{mode}_api_secret", "")
@@ -400,14 +475,11 @@ class BotRunner:
             base_url = "https://fapi.binance.com"
         
         try:
-            # Close position (opposite side)
-            symbol = self.active_position["symbol"]
-            quantity = self.active_position["quantity"]
-            side = "SELL" if self.active_position["direction"] == "LONG" else "BUY"
+            side = "SELL" if pos.signal.direction == TradeDirection.LONG else "BUY"
             
             timestamp = int(time.time() * 1000)
             params = {
-                "symbol": symbol,
+                "symbol": pos.signal.symbol,
                 "side": side,
                 "type": "MARKET",
                 "quantity": quantity,
@@ -416,9 +488,7 @@ class BotRunner:
             
             query_string = "&".join([f"{k}={v}" for k, v in params.items()])
             signature = hmac.new(
-                api_secret.encode(),
-                query_string.encode(),
-                hashlib.sha256
+                api_secret.encode(), query_string.encode(), hashlib.sha256
             ).hexdigest()
             params["signature"] = signature
             
@@ -430,17 +500,70 @@ class BotRunner:
                 )
                 
                 if response.status_code == 200:
-                    # Calculate P&L
-                    entry = self.active_position["entry_price"]
-                    if self.active_position["direction"] == "LONG":
-                        pnl = (exit_price - entry) / entry * 100
-                    else:
-                        pnl = (entry - exit_price) / entry * 100
+                    pnl_pct = self._calculate_pnl_pct(pos, exit_price)
+                    self._log(f"✅ Partial close ({reason}): {quantity} @ ${exit_price:,.2f} | P&L: {pnl_pct:.2f}%")
+                    pos.remaining_qty -= quantity
+                else:
+                    error = response.json().get("msg", response.text)
+                    self._log(f"❌ Partial close failed: {error}")
                     
-                    result = "WIN" if pnl > 0 else "LOSS"
+        except Exception as e:
+            self._log(f"❌ Partial close error: {e}")
+    
+    async def _close_full_position(self, reason: str, exit_price: float):
+        """Close full remaining position."""
+        if not self.active_position:
+            return
+        
+        pos = self.active_position
+        mode = self.settings.get("mode", "testnet")
+        api_key = self.settings.get(f"{mode}_api_key", "")
+        api_secret = self.settings.get(f"{mode}_api_secret", "")
+        
+        if mode == "testnet":
+            base_url = "https://testnet.binancefuture.com"
+        else:
+            base_url = "https://fapi.binance.com"
+        
+        try:
+            side = "SELL" if pos.signal.direction == TradeDirection.LONG else "BUY"
+            
+            timestamp = int(time.time() * 1000)
+            params = {
+                "symbol": pos.signal.symbol,
+                "side": side,
+                "type": "MARKET",
+                "quantity": pos.remaining_qty,
+                "timestamp": timestamp,
+            }
+            
+            query_string = "&".join([f"{k}={v}" for k, v in params.items()])
+            signature = hmac.new(
+                api_secret.encode(), query_string.encode(), hashlib.sha256
+            ).hexdigest()
+            params["signature"] = signature
+            
+            async with httpx.AsyncClient(timeout=10) as client:
+                response = await client.post(
+                    f"{base_url}/fapi/v1/order",
+                    params=params,
+                    headers={"X-MBX-APIKEY": api_key}
+                )
+                
+                if response.status_code == 200:
+                    pnl_pct = self._calculate_pnl_pct(pos, exit_price)
+                    result = "WIN" if pnl_pct > 0 else "LOSS"
                     emoji = "🟢" if result == "WIN" else "🔴"
                     
-                    self._log(f"{emoji} Position closed ({reason}): {result} {pnl:.2f}%")
+                    self._log(f"")
+                    self._log(f"{'='*50}")
+                    self._log(f"{emoji} POSITION CLOSED - {reason}")
+                    self._log(f"{'='*50}")
+                    self._log(f"Result: {result}")
+                    self._log(f"P&L: {pnl_pct:.2f}%")
+                    self._log(f"Entry: ${pos.signal.entry_price:,.2f}")
+                    self._log(f"Exit: ${exit_price:,.2f}")
+                    self._log(f"{'='*50}")
                     
                     self.active_position = None
                 else:
@@ -450,8 +573,16 @@ class BotRunner:
         except Exception as e:
             self._log(f"❌ Close position error: {e}")
     
+    def _calculate_pnl_pct(self, pos: ActivePosition, exit_price: float) -> float:
+        """Calculate P&L percentage."""
+        entry = pos.signal.entry_price
+        if pos.signal.direction == TradeDirection.LONG:
+            return (exit_price - entry) / entry * 100
+        else:
+            return (entry - exit_price) / entry * 100
+    
     async def get_balance(self) -> Optional[float]:
-        """Get current USDT balance from Binance."""
+        """Get USDT balance from Binance."""
         mode = self.settings.get("mode", "testnet")
         api_key = self.settings.get(f"{mode}_api_key", "")
         api_secret = self.settings.get(f"{mode}_api_secret", "")
@@ -468,9 +599,7 @@ class BotRunner:
             timestamp = int(time.time() * 1000)
             query = f"timestamp={timestamp}"
             signature = hmac.new(
-                api_secret.encode(),
-                query.encode(),
-                hashlib.sha256
+                api_secret.encode(), query.encode(), hashlib.sha256
             ).hexdigest()
             
             async with httpx.AsyncClient(timeout=10) as client:
@@ -485,11 +614,10 @@ class BotRunner:
                     usdt = next((b for b in balances if b["asset"] == "USDT"), None)
                     return float(usdt["balance"]) if usdt else 0
         except Exception as e:
-            logger.error(f"Balance fetch error: {e}")
+            logger.error(f"Balance error: {e}")
         
         return None
 
 
 # Global bot instance
 bot_runner = BotRunner()
-
