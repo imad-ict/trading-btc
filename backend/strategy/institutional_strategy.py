@@ -1,17 +1,26 @@
 """
-Institutional Strategy v4 - Liquidity-First
+FAILURE-BASED LIQUIDITY REVERSAL STRATEGY v5
 
-CORE PRINCIPLES:
-1. Trade LIQUIDITY, not indicators
-2. Market context FIRST (no CHOP trading)
-3. Structural SL (move on new HL/LH, not profit)
-4. Destination-based TP (VWAP, opposite pool, FVG)
+🚫 THIS IS THE ANTI-RETAIL VERSION 🚫
 
-ENTRY HIERARCHY:
-1. Market Regime Check (EXPANSION/MANIPULATION only)
-2. Liquidity Sweep Detection (MANDATORY)
-3. Structure Confirmation (reclaim/rejection)
-4. Filters: VWAP alignment, RSI filter
+Core Philosophy:
+- The first move is usually a trap
+- Pullbacks collect liquidity (don't trade them)
+- Breakouts inside balance are fake
+- Expansion happens AFTER failure
+
+OPPOSITE BEHAVIOR:
+- Old system enters on pullback → New system WAITS
+- Old system enters on momentum → New system SKIPS
+- Old system protects early (BE) → New system gives room
+- Old system trades anywhere → New system requires BALANCE + FAILURE
+
+Entry Hierarchy:
+1. REQUIRE balance (VWAP flat, overlap > 65%)
+2. REQUIRE failure (push attempt that stalls)
+3. REQUIRE sweep (liquidity taken)
+4. REQUIRE reclaim (confirmation candle)
+5. DELAY 1 candle minimum
 """
 import numpy as np
 from typing import Dict, List, Optional, Tuple
@@ -24,27 +33,23 @@ import logging
 logger = logging.getLogger(__name__)
 
 
-class MarketRegime(Enum):
-    """Market regime classification."""
-    EXPANSION = "expansion"      # Trending, tradable
-    MANIPULATION = "manipulation"  # Sweep reversal, tradable
-    CHOP = "chop"                # Balanced, NO TRADING
+class MarketState(Enum):
+    """Market state classification - BALANCE is tradable, TREND is not."""
+    BALANCE = "balance"      # Flat VWAP, overlap > 65% → TRADABLE
+    TRENDING = "trending"    # Clear direction → DO NOT TRADE
+    UNKNOWN = "unknown"      # Insufficient data → DO NOT TRADE
 
 
-class TrendDirection(Enum):
-    BULLISH = "bullish"
-    BEARISH = "bearish"
-    RANGING = "ranging"
+class FailureType(Enum):
+    """Type of failure detected."""
+    FAILED_PUSH_UP = "failed_push_up"    # Bulls failed → SHORT setup
+    FAILED_PUSH_DOWN = "failed_push_down"  # Bears failed → LONG setup
+    NO_FAILURE = "no_failure"
 
 
 class TradeDirection(Enum):
     LONG = "LONG"
     SHORT = "SHORT"
-
-
-class EntryType(Enum):
-    LIQUIDITY_SWEEP = "liquidity_sweep"
-    ORDER_BLOCK = "order_block"
 
 
 @dataclass
@@ -81,69 +86,69 @@ class Candle:
         if self.total_range == 0:
             return 0
         return self.body_size / self.total_range
+    
+    @property
+    def is_stalling(self) -> bool:
+        """Stalling = small body, wicks on both sides."""
+        return self.body_pct < 0.4 and self.upper_wick > 0 and self.lower_wick > 0
 
 
 @dataclass
-class LiquiditySweep:
-    """Detected liquidity sweep event."""
-    price_level: float
+class FailedPush:
+    """Detected failed push (failure to continue)."""
+    direction: str  # "up" or "down"
+    start_price: float
+    failure_price: float
+    timestamp: float
+    candle_count: int
+
+
+@dataclass
+class SweepEvent:
+    """Liquidity sweep event with reclaim status."""
+    level: float
     sweep_type: str  # "low" or "high"
-    swept_at: float  # timestamp
+    sweep_candle: Candle
     reclaimed: bool = False
     reclaim_candle: Optional[Candle] = None
-
-
-@dataclass
-class SignalQuality:
-    """Signal quality scoring for entry validation."""
-    sweep_quality: int = 0      # 0-25: depth of sweep, wick rejection
-    displacement: int = 0       # 0-25: strength of reclaim candle
-    volume_expansion: int = 0   # 0-25: volume vs average
-    session_timing: int = 0     # 0-25: London/NY = max, Asian = min
-    
-    @property
-    def total_score(self) -> int:
-        return self.sweep_quality + self.displacement + self.volume_expansion + self.session_timing
-    
-    @property
-    def is_valid(self) -> bool:
-        return self.total_score >= 60
+    confirmation_pending: bool = True  # Wait 1 candle after reclaim
 
 
 @dataclass
 class TradeSignal:
     symbol: str
     direction: TradeDirection
-    entry_type: EntryType
     entry_price: float
     stop_loss: float
-    tp1: float  # VWAP/mean
-    tp2: float  # Opposite liquidity
-    tp3: float  # FVG/range boundary
-    vwap: float
-    regime: MarketRegime
-    quality_score: int
+    tp1: float  # Opposite side of balance
+    tp2: float  # Liquidity pool
+    tp3: float  # Expansion target
+    failure_type: FailureType
     reason: str
+    why_old_system_would_lose: str
     
     @property
-    def risk_distance(self) -> float:
+    def sl_distance_pct(self) -> float:
         return abs(self.entry_price - self.stop_loss) / self.entry_price
     
     @property
     def is_valid(self) -> bool:
-        # Valid SL distance: 0.15% to 0.35% (institutional scalping)
-        return 0.0015 <= self.risk_distance <= 0.0035
+        # SL must survive noise: 0.2% to 0.4%
+        return 0.002 <= self.sl_distance_pct <= 0.004
 
 
-class InstitutionalStrategy:
+class FailureReversalStrategy:
     """
-    Liquidity-First Institutional Strategy v4
+    FAILURE-BASED LIQUIDITY REVERSAL
     
-    Rules:
-    1. ONLY trade EXPANSION or MANIPULATION regimes
-    2. REQUIRE liquidity sweep + reclaim before entry
-    3. Indicators (VWAP, RSI) are FILTERS only
-    4. SL moves on STRUCTURE, not profit
+    This strategy does the OPPOSITE of retail:
+    1. WAIT for balance (flat market)
+    2. WAIT for failure (push that stalls)
+    3. WAIT for sweep (liquidity taken)
+    4. WAIT for reclaim (confirmation)
+    5. DELAY 1 candle (avoid trap)
+    
+    NO MOMENTUM. NO PULLBACKS. NO EARLY ENTRIES.
     """
     
     def __init__(self, max_positions: int = 3):
@@ -152,45 +157,38 @@ class InstitutionalStrategy:
         self.candles_5m: Dict[str, deque] = {}
         self.candles_15m: Dict[str, deque] = {}
         
-        # Liquidity tracking
-        self.swing_highs: Dict[str, List[float]] = {}
-        self.swing_lows: Dict[str, List[float]] = {}
-        self.recent_sweeps: Dict[str, List[LiquiditySweep]] = {}
-        
-        # Session levels
-        self.session_high: Dict[str, float] = {}
-        self.session_low: Dict[str, float] = {}
-        
-        # Technical indicators (FILTERS ONLY)
+        # Market state
+        self.market_state: Dict[str, MarketState] = {}
         self.vwap: Dict[str, float] = {}
         self.vwap_data: Dict[str, List[Tuple[float, float]]] = {}
-        self.rsi: Dict[str, float] = {}
         
-        # Market regime
-        self.regime: Dict[str, MarketRegime] = {}
+        # Failure tracking
+        self.failed_pushes: Dict[str, List[FailedPush]] = {}
+        self.pending_sweeps: Dict[str, List[SweepEvent]] = {}
+        
+        # Balance range
+        self.balance_high: Dict[str, float] = {}
+        self.balance_low: Dict[str, float] = {}
         
         # Configuration
         self.max_positions = max_positions
-        self.rsi_period = 14
-        self.quality_threshold = 60
         self.max_candles = 100
-        self.sl_buffer_pct = 0.001  # 0.1% buffer
+        self.balance_overlap_threshold = 0.65  # 65% overlap = balance
+        self.vwap_flat_threshold = 0.001  # 0.1% = flat VWAP
     
     def get_diagnostics(self, symbol: str) -> Dict:
-        """Get diagnostic info for a symbol."""
         return {
             "symbol": symbol,
-            "regime": self.regime.get(symbol, MarketRegime.CHOP).value,
-            "candles_5m": len(self.candles_5m.get(symbol, [])),
-            "swing_highs": len(self.swing_highs.get(symbol, [])),
-            "swing_lows": len(self.swing_lows.get(symbol, [])),
-            "recent_sweeps": len([s for s in self.recent_sweeps.get(symbol, []) if not s.reclaimed]),
-            "rsi": round(self.rsi.get(symbol, 50), 1),
+            "state": self.market_state.get(symbol, MarketState.UNKNOWN).value,
             "vwap": self.vwap.get(symbol),
+            "balance_high": self.balance_high.get(symbol),
+            "balance_low": self.balance_low.get(symbol),
+            "pending_sweeps": len(self.pending_sweeps.get(symbol, [])),
+            "failed_pushes": len(self.failed_pushes.get(symbol, [])),
         }
     
     def add_candle(self, symbol: str, candle: Candle, timeframe: str = "1m"):
-        """Add a candle and update all derived data."""
+        """Add candle and update state."""
         storage_map = {
             "1m": self.candles_1m,
             "5m": self.candles_5m,
@@ -204,19 +202,17 @@ class InstitutionalStrategy:
         
         storage[symbol].append(candle)
         
-        # Update indicators based on timeframe
         if timeframe == "1m":
             self._update_vwap(symbol, candle)
-            self._update_rsi(symbol)
-            self._update_session_levels(symbol, candle)
         
         if timeframe == "5m":
-            self._update_swing_points(symbol)
-            self._detect_liquidity_sweeps(symbol, candle)
-            self._update_market_regime(symbol)
+            self._update_market_state(symbol)
+            self._detect_failures(symbol)
+            self._detect_sweeps(symbol, candle)
+            self._check_reclaims(symbol, candle)
     
     def _update_vwap(self, symbol: str, candle: Candle):
-        """Update VWAP calculation."""
+        """Update VWAP."""
         if symbol not in self.vwap_data:
             self.vwap_data[symbol] = []
         
@@ -232,355 +228,295 @@ class InstitutionalStrategy:
         if total_v > 0:
             self.vwap[symbol] = total_pv / total_v
     
-    def _update_rsi(self, symbol: str):
-        """Calculate RSI from 1M closes."""
-        candles = list(self.candles_1m.get(symbol, []))
-        if len(candles) < self.rsi_period + 1:
-            self.rsi[symbol] = 50
-            return
-        
-        closes = [c.close for c in candles[-(self.rsi_period + 1):]]
-        changes = [closes[i] - closes[i-1] for i in range(1, len(closes))]
-        
-        gains = [c if c > 0 else 0 for c in changes]
-        losses = [-c if c < 0 else 0 for c in changes]
-        
-        avg_gain = sum(gains) / self.rsi_period
-        avg_loss = sum(losses) / self.rsi_period
-        
-        if avg_loss == 0:
-            self.rsi[symbol] = 100
-        else:
-            rs = avg_gain / avg_loss
-            self.rsi[symbol] = 100 - (100 / (1 + rs))
-    
-    def _update_session_levels(self, symbol: str, candle: Candle):
-        """Track session high/low (last 4 hours)."""
-        candles = list(self.candles_1m.get(symbol, []))[-240:]  # 4 hours
-        if not candles:
-            return
-        
-        self.session_high[symbol] = max(c.high for c in candles)
-        self.session_low[symbol] = min(c.low for c in candles)
-    
-    def _update_swing_points(self, symbol: str):
-        """Track swing highs and lows from 5M for liquidity levels."""
-        candles = list(self.candles_5m.get(symbol, []))
-        if len(candles) < 5:
-            return
-        
-        if symbol not in self.swing_highs:
-            self.swing_highs[symbol] = []
-        if symbol not in self.swing_lows:
-            self.swing_lows[symbol] = []
-        
-        # Look for swing points (3-candle pattern)
-        for i in range(2, len(candles) - 2):
-            # Swing high: higher than 2 candles before and after
-            if (candles[i].high > candles[i-1].high and 
-                candles[i].high > candles[i-2].high and
-                candles[i].high > candles[i+1].high and 
-                candles[i].high > candles[i+2].high):
-                level = candles[i].high
-                if level not in self.swing_highs[symbol]:
-                    self.swing_highs[symbol].append(level)
-            
-            # Swing low: lower than 2 candles before and after
-            if (candles[i].low < candles[i-1].low and 
-                candles[i].low < candles[i-2].low and
-                candles[i].low < candles[i+1].low and 
-                candles[i].low < candles[i+2].low):
-                level = candles[i].low
-                if level not in self.swing_lows[symbol]:
-                    self.swing_lows[symbol].append(level)
-        
-        # Keep only recent swing points
-        self.swing_highs[symbol] = self.swing_highs[symbol][-15:]
-        self.swing_lows[symbol] = self.swing_lows[symbol][-15:]
-    
-    def _detect_liquidity_sweeps(self, symbol: str, candle: Candle):
-        """Detect when price sweeps a liquidity level and reclaims."""
-        if symbol not in self.recent_sweeps:
-            self.recent_sweeps[symbol] = []
-        
-        swing_highs = self.swing_highs.get(symbol, [])
-        swing_lows = self.swing_lows.get(symbol, [])
-        session_high = self.session_high.get(symbol)
-        session_low = self.session_low.get(symbol)
-        
-        tolerance = candle.close * 0.0005  # 0.05% tolerance
-        
-        # Check for LOW sweep (bullish setup)
-        for low_level in swing_lows + ([session_low] if session_low else []):
-            if low_level is None:
-                continue
-            # Price went below level (sweep) but closed above (reclaim)
-            if candle.low < low_level - tolerance and candle.close > low_level:
-                # Validate rejection wick
-                if candle.lower_wick > candle.body_size * 0.5:
-                    sweep = LiquiditySweep(
-                        price_level=low_level,
-                        sweep_type="low",
-                        swept_at=candle.timestamp,
-                        reclaimed=True,
-                        reclaim_candle=candle
-                    )
-                    self.recent_sweeps[symbol].append(sweep)
-        
-        # Check for HIGH sweep (bearish setup)
-        for high_level in swing_highs + ([session_high] if session_high else []):
-            if high_level is None:
-                continue
-            # Price went above level (sweep) but closed below (reclaim)
-            if candle.high > high_level + tolerance and candle.close < high_level:
-                # Validate rejection wick
-                if candle.upper_wick > candle.body_size * 0.5:
-                    sweep = LiquiditySweep(
-                        price_level=high_level,
-                        sweep_type="high",
-                        swept_at=candle.timestamp,
-                        reclaimed=True,
-                        reclaim_candle=candle
-                    )
-                    self.recent_sweeps[symbol].append(sweep)
-        
-        # Clean old sweeps (keep last 10)
-        self.recent_sweeps[symbol] = self.recent_sweeps[symbol][-10:]
-    
-    def _update_market_regime(self, symbol: str):
+    def _update_market_state(self, symbol: str):
         """
-        Classify market regime.
+        Detect BALANCE vs TRENDING.
         
-        EXPANSION: Trending, large candles, low overlap
-        MANIPULATION: Recent sweep + reversal
-        CHOP: Flat VWAP, high candle overlap
+        BALANCE (tradable):
+        - VWAP slope is FLAT (< 0.1%)
+        - Candle overlap > 65%
+        - Multiple failed pushes
+        
+        TRENDING (do not trade):
+        - Clear direction
+        - VWAP slope significant
         """
         candles = list(self.candles_5m.get(symbol, []))
         if len(candles) < 10:
-            self.regime[symbol] = MarketRegime.CHOP
+            self.market_state[symbol] = MarketState.UNKNOWN
             return
         
         recent = candles[-10:]
         
-        # Calculate candle overlap percentage
-        overlap_count = 0
+        # Calculate overlap percentage
+        overlapping = 0
         for i in range(1, len(recent)):
-            prev_range = (recent[i-1].low, recent[i-1].high)
-            curr_range = (recent[i].low, recent[i].high)
-            overlap = max(0, min(prev_range[1], curr_range[1]) - max(prev_range[0], curr_range[0]))
-            prev_size = prev_range[1] - prev_range[0]
-            if prev_size > 0 and overlap / prev_size > 0.7:
-                overlap_count += 1
+            prev = (recent[i-1].low, recent[i-1].high)
+            curr = (recent[i].low, recent[i].high)
+            overlap = max(0, min(prev[1], curr[1]) - max(prev[0], curr[0]))
+            range_size = max(prev[1] - prev[0], curr[1] - curr[0])
+            if range_size > 0 and overlap / range_size > 0.5:
+                overlapping += 1
         
-        overlap_pct = overlap_count / (len(recent) - 1)
+        overlap_pct = overlapping / (len(recent) - 1)
         
-        # Calculate VWAP slope (flat = chop)
-        vwap_values = []
-        for i, c in enumerate(recent):
-            tp = (c.high + c.low + c.close) / 3
-            vwap_values.append(tp)
+        # Calculate VWAP slope
+        vwap_start = (recent[0].high + recent[0].low + recent[0].close) / 3
+        vwap_end = (recent[-1].high + recent[-1].low + recent[-1].close) / 3
+        vwap_change = abs(vwap_end - vwap_start) / vwap_start if vwap_start > 0 else 0
         
-        if len(vwap_values) >= 2:
-            vwap_change = abs(vwap_values[-1] - vwap_values[0]) / vwap_values[0]
+        # BALANCE: flat VWAP + high overlap
+        if overlap_pct >= self.balance_overlap_threshold and vwap_change < self.vwap_flat_threshold:
+            self.market_state[symbol] = MarketState.BALANCE
+            # Update balance range
+            self.balance_high[symbol] = max(c.high for c in recent)
+            self.balance_low[symbol] = min(c.low for c in recent)
         else:
-            vwap_change = 0
-        
-        # Check for recent liquidity sweep (manipulation)
-        recent_sweeps = [s for s in self.recent_sweeps.get(symbol, []) if s.reclaimed]
-        has_recent_sweep = len(recent_sweeps) > 0
-        
-        # Regime classification
-        if has_recent_sweep:
-            self.regime[symbol] = MarketRegime.MANIPULATION
-        elif overlap_pct > 0.6 and vwap_change < 0.002:
-            self.regime[symbol] = MarketRegime.CHOP
-        else:
-            self.regime[symbol] = MarketRegime.EXPANSION
+            self.market_state[symbol] = MarketState.TRENDING
     
-    def _calculate_signal_quality(self, symbol: str, sweep: LiquiditySweep, 
-                                   candle: Candle) -> SignalQuality:
-        """Calculate signal quality score."""
-        quality = SignalQuality()
+    def _detect_failures(self, symbol: str):
+        """
+        Detect FAILED PUSHES - the heart of this strategy.
         
-        # Sweep quality (0-25): depth of sweep + wick rejection
-        if sweep.reclaim_candle:
-            wick_ratio = (sweep.reclaim_candle.lower_wick if sweep.sweep_type == "low" 
-                         else sweep.reclaim_candle.upper_wick) / max(sweep.reclaim_candle.total_range, 0.01)
-            quality.sweep_quality = min(25, int(wick_ratio * 50))
+        FAILED PUSH UP: Attempt to hold above VWAP that stalls
+        FAILED PUSH DOWN: Attempt to hold below VWAP that stalls
+        """
+        if self.market_state.get(symbol) != MarketState.BALANCE:
+            return  # Only detect failures in BALANCE
         
-        # Displacement (0-25): strength of reclaim candle
-        if candle.body_pct > 0.6:
-            quality.displacement = 25
-        elif candle.body_pct > 0.4:
-            quality.displacement = 15
-        else:
-            quality.displacement = 5
+        candles = list(self.candles_5m.get(symbol, []))
+        if len(candles) < 5:
+            return
         
-        # Volume (0-25): simplified - use body size as proxy
-        avg_body = np.mean([c.body_size for c in list(self.candles_5m.get(symbol, []))[-20:]])
-        if avg_body > 0:
-            vol_ratio = candle.body_size / avg_body
-            quality.volume_expansion = min(25, int(vol_ratio * 15))
+        if symbol not in self.failed_pushes:
+            self.failed_pushes[symbol] = []
         
-        # Session timing (0-25): London/NY overlap = best
-        # Simplified: always give 15 for now (can add actual time check)
-        quality.session_timing = 15
+        vwap = self.vwap.get(symbol)
+        if not vwap:
+            return
         
-        return quality
+        recent = candles[-5:]
+        
+        # Check for FAILED PUSH UP (bulls fail → SHORT setup coming)
+        above_vwap = [c for c in recent if c.close > vwap]
+        if len(above_vwap) >= 2:
+            # Check if stalling (last candles have small bodies)
+            stalling = sum(1 for c in recent[-3:] if c.is_stalling)
+            if stalling >= 2:
+                failure = FailedPush(
+                    direction="up",
+                    start_price=above_vwap[0].close,
+                    failure_price=recent[-1].close,
+                    timestamp=recent[-1].timestamp,
+                    candle_count=len(above_vwap)
+                )
+                self.failed_pushes[symbol].append(failure)
+        
+        # Check for FAILED PUSH DOWN (bears fail → LONG setup coming)
+        below_vwap = [c for c in recent if c.close < vwap]
+        if len(below_vwap) >= 2:
+            stalling = sum(1 for c in recent[-3:] if c.is_stalling)
+            if stalling >= 2:
+                failure = FailedPush(
+                    direction="down",
+                    start_price=below_vwap[0].close,
+                    failure_price=recent[-1].close,
+                    timestamp=recent[-1].timestamp,
+                    candle_count=len(below_vwap)
+                )
+                self.failed_pushes[symbol].append(failure)
+        
+        # Keep only recent failures
+        self.failed_pushes[symbol] = self.failed_pushes[symbol][-5:]
+    
+    def _detect_sweeps(self, symbol: str, candle: Candle):
+        """Detect liquidity sweeps at balance extremes."""
+        if self.market_state.get(symbol) != MarketState.BALANCE:
+            return
+        
+        if symbol not in self.pending_sweeps:
+            self.pending_sweeps[symbol] = []
+        
+        balance_high = self.balance_high.get(symbol)
+        balance_low = self.balance_low.get(symbol)
+        
+        if not balance_high or not balance_low:
+            return
+        
+        tolerance = candle.close * 0.001  # 0.1%
+        
+        # SWEEP LOW (bullish setup forming)
+        if candle.low < balance_low - tolerance:
+            # Check for rejection wick (lower wick > body)
+            if candle.lower_wick > candle.body_size:
+                sweep = SweepEvent(
+                    level=balance_low,
+                    sweep_type="low",
+                    sweep_candle=candle
+                )
+                self.pending_sweeps[symbol].append(sweep)
+        
+        # SWEEP HIGH (bearish setup forming)
+        if candle.high > balance_high + tolerance:
+            if candle.upper_wick > candle.body_size:
+                sweep = SweepEvent(
+                    level=balance_high,
+                    sweep_type="high",
+                    sweep_candle=candle
+                )
+                self.pending_sweeps[symbol].append(sweep)
+        
+        # Clean old sweeps
+        self.pending_sweeps[symbol] = self.pending_sweeps[symbol][-5:]
+    
+    def _check_reclaims(self, symbol: str, candle: Candle):
+        """Check if pending sweeps have been reclaimed."""
+        for sweep in self.pending_sweeps.get(symbol, []):
+            if sweep.reclaimed:
+                # Already reclaimed, check if confirmation period passed
+                if sweep.confirmation_pending:
+                    sweep.confirmation_pending = False  # 1 candle delay done
+                continue
+            
+            # Check for reclaim
+            if sweep.sweep_type == "low":
+                # LONG: Close back ABOVE the swept level
+                if candle.close > sweep.level and candle.is_bullish:
+                    sweep.reclaimed = True
+                    sweep.reclaim_candle = candle
+            
+            elif sweep.sweep_type == "high":
+                # SHORT: Close back BELOW the swept level
+                if candle.close < sweep.level and not candle.is_bullish:
+                    sweep.reclaimed = True
+                    sweep.reclaim_candle = candle
     
     def generate_signal(self, symbol: str, current_candle: Candle) -> Optional[TradeSignal]:
         """
-        Generate trading signal with LIQUIDITY-FIRST logic.
+        Generate signal using FAILURE-BASED logic.
         
-        Entry ONLY when:
-        1. Market regime is EXPANSION or MANIPULATION (NOT CHOP)
-        2. Liquidity has been swept and reclaimed
-        3. Quality score >= 60
-        4. VWAP and RSI filters pass
+        Requirements (ALL must be true):
+        1. Market is in BALANCE
+        2. A failure has been detected
+        3. Liquidity has been swept
+        4. Sweep has been reclaimed
+        5. 1 candle delay has passed (confirmation_pending = False)
+        6. DO NOT enter on momentum candle
         """
-        regime = self.regime.get(symbol, MarketRegime.CHOP)
-        vwap = self.vwap.get(symbol)
-        rsi = self.rsi.get(symbol, 50)
-        
-        # RULE 1: NO TRADING IN CHOP
-        if regime == MarketRegime.CHOP:
+        # RULE 1: Must be BALANCE
+        state = self.market_state.get(symbol, MarketState.UNKNOWN)
+        if state != MarketState.BALANCE:
             return None
         
-        if not vwap:
+        # RULE 2: Check for failures
+        failures = self.failed_pushes.get(symbol, [])
+        if not failures:
             return None
         
-        # RULE 2: Find valid liquidity sweep
-        recent_sweeps = [s for s in self.recent_sweeps.get(symbol, []) 
-                        if s.reclaimed and s.reclaim_candle is not None]
-        
-        if not recent_sweeps:
-            return None  # NO SWEEP = NO TRADE
-        
-        # Get most recent sweep
-        sweep = recent_sweeps[-1]
-        
-        # RULE 3: Calculate signal quality
-        quality = self._calculate_signal_quality(symbol, sweep, current_candle)
-        
-        if not quality.is_valid:
-            return None  # Quality too low
-        
-        # RULE 4: VWAP and RSI filters
-        vwap_dist = (current_candle.close - vwap) / vwap
-        
-        if sweep.sweep_type == "low":  # LONG setup
-            # VWAP filter: price should be near or above VWAP
-            if vwap_dist < -0.005:  # Too far below VWAP
-                return None
-            # RSI filter: not extremely overbought
-            if rsi > 75:
-                return None
+        # RULE 3 & 4 & 5: Check for confirmed sweeps
+        for sweep in self.pending_sweeps.get(symbol, []):
+            if not sweep.reclaimed:
+                continue
+            if sweep.confirmation_pending:
+                continue  # Wait for 1 candle delay
             
-            return self._create_long_signal(symbol, sweep, current_candle, 
-                                            regime, quality.total_score)
-        
-        elif sweep.sweep_type == "high":  # SHORT setup
-            # VWAP filter: price should be near or below VWAP
-            if vwap_dist > 0.005:  # Too far above VWAP
-                return None
-            # RSI filter: not extremely oversold
-            if rsi < 25:
-                return None
+            # RULE 6: Do NOT enter on momentum candle
+            if current_candle.body_pct > 0.7:
+                continue  # Skip strong candles (momentum)
             
-            return self._create_short_signal(symbol, sweep, current_candle,
-                                             regime, quality.total_score)
+            # Find matching failure
+            if sweep.sweep_type == "low":
+                # Looking for FAILED_PUSH_DOWN → LONG
+                matching_failure = next(
+                    (f for f in failures if f.direction == "down"), 
+                    None
+                )
+                if matching_failure:
+                    return self._create_long_signal(symbol, sweep, matching_failure, current_candle)
+            
+            elif sweep.sweep_type == "high":
+                # Looking for FAILED_PUSH_UP → SHORT
+                matching_failure = next(
+                    (f for f in failures if f.direction == "up"),
+                    None
+                )
+                if matching_failure:
+                    return self._create_short_signal(symbol, sweep, matching_failure, current_candle)
         
         return None
     
-    def _create_long_signal(self, symbol: str, sweep: LiquiditySweep,
-                            candle: Candle, regime: MarketRegime,
-                            quality_score: int) -> Optional[TradeSignal]:
-        """Create LONG signal with destination-based TP."""
+    def _create_long_signal(self, symbol: str, sweep: SweepEvent, 
+                            failure: FailedPush, candle: Candle) -> Optional[TradeSignal]:
+        """Create LONG signal after bearish failure."""
         vwap = self.vwap.get(symbol, candle.close)
+        balance_high = self.balance_high.get(symbol, candle.close + candle.total_range * 3)
         
-        # SL: Inside the wick midpoint (not exact low)
-        wick_low = sweep.reclaim_candle.low if sweep.reclaim_candle else candle.low
-        sl = (wick_low + candle.low) / 2 * (1 - self.sl_buffer_pct)
+        # SL: Midpoint of sweep wick (NOT at the low)
+        sweep_low = sweep.sweep_candle.low
+        wick_midpoint = (sweep_low + sweep.level) / 2
+        sl = wick_midpoint * 0.999  # Tiny buffer
         
-        # Destination-based TP
-        risk = candle.close - sl
-        swing_highs = self.swing_highs.get(symbol, [])
+        # TP: Destination-based
+        tp1 = vwap  # Opposite side of balance
+        tp2 = balance_high  # Balance high (liquidity)
+        tp3 = balance_high + (balance_high - sweep_low)  # Expansion
         
-        # TP1: VWAP or mean (whichever is closer target)
-        tp1 = max(vwap, candle.close + risk * 1.5)
-        
-        # TP2: Nearest swing high (opposite liquidity)
-        higher_highs = [h for h in swing_highs if h > candle.close]
-        tp2 = min(higher_highs) if higher_highs else candle.close + risk * 2.5
-        
-        # TP3: Session high or range boundary
-        session_high = self.session_high.get(symbol, candle.close + risk * 4)
-        tp3 = max(session_high, tp2 + risk)
+        why_old_loses = f"Old system would enter on VWAP pullback BEFORE failure. Price was at ${failure.start_price:,.0f}, pushed down, and old system would buy the pullback. Instead, we waited for failure confirmation."
         
         signal = TradeSignal(
             symbol=symbol,
             direction=TradeDirection.LONG,
-            entry_type=EntryType.LIQUIDITY_SWEEP,
             entry_price=candle.close,
             stop_loss=sl,
             tp1=tp1,
             tp2=tp2,
             tp3=tp3,
-            vwap=vwap,
-            regime=regime,
-            quality_score=quality_score,
-            reason=f"Liquidity Sweep LONG | Low swept @ ${sweep.price_level:,.0f} | Score: {quality_score}"
+            failure_type=FailureType.FAILED_PUSH_DOWN,
+            reason=f"Bears failed at ${failure.failure_price:,.0f} | Sweep @ ${sweep.level:,.0f} reclaimed",
+            why_old_system_would_lose=why_old_loses
         )
         
         if signal.is_valid:
-            # Remove used sweep
-            self.recent_sweeps[symbol] = [s for s in self.recent_sweeps[symbol] if s != sweep]
+            # Clear used sweep and failure
+            self.pending_sweeps[symbol] = [s for s in self.pending_sweeps[symbol] if s != sweep]
+            self.failed_pushes[symbol] = [f for f in self.failed_pushes[symbol] if f != failure]
             return signal
         return None
     
-    def _create_short_signal(self, symbol: str, sweep: LiquiditySweep,
-                             candle: Candle, regime: MarketRegime,
-                             quality_score: int) -> Optional[TradeSignal]:
-        """Create SHORT signal with destination-based TP."""
+    def _create_short_signal(self, symbol: str, sweep: SweepEvent,
+                             failure: FailedPush, candle: Candle) -> Optional[TradeSignal]:
+        """Create SHORT signal after bullish failure."""
         vwap = self.vwap.get(symbol, candle.close)
+        balance_low = self.balance_low.get(symbol, candle.close - candle.total_range * 3)
         
-        # SL: Inside the wick midpoint (not exact high)
-        wick_high = sweep.reclaim_candle.high if sweep.reclaim_candle else candle.high
-        sl = (wick_high + candle.high) / 2 * (1 + self.sl_buffer_pct)
+        # SL: Midpoint of sweep wick (NOT at the high)
+        sweep_high = sweep.sweep_candle.high
+        wick_midpoint = (sweep_high + sweep.level) / 2
+        sl = wick_midpoint * 1.001  # Tiny buffer
         
-        # Destination-based TP
-        risk = sl - candle.close
-        swing_lows = self.swing_lows.get(symbol, [])
+        # TP: Destination-based
+        tp1 = vwap
+        tp2 = balance_low
+        tp3 = balance_low - (sweep_high - balance_low)  # Expansion
         
-        # TP1: VWAP or mean
-        tp1 = min(vwap, candle.close - risk * 1.5)
-        
-        # TP2: Nearest swing low (opposite liquidity)
-        lower_lows = [l for l in swing_lows if l < candle.close]
-        tp2 = max(lower_lows) if lower_lows else candle.close - risk * 2.5
-        
-        # TP3: Session low or range boundary
-        session_low = self.session_low.get(symbol, candle.close - risk * 4)
-        tp3 = min(session_low, tp2 - risk)
+        why_old_loses = f"Old system would enter SHORT on VWAP rejection BEFORE failure. Price was at ${failure.start_price:,.0f}, pushed up, and old system would sell. Instead, we waited for confirmation."
         
         signal = TradeSignal(
             symbol=symbol,
             direction=TradeDirection.SHORT,
-            entry_type=EntryType.LIQUIDITY_SWEEP,
             entry_price=candle.close,
             stop_loss=sl,
             tp1=tp1,
             tp2=tp2,
             tp3=tp3,
-            vwap=vwap,
-            regime=regime,
-            quality_score=quality_score,
-            reason=f"Liquidity Sweep SHORT | High swept @ ${sweep.price_level:,.0f} | Score: {quality_score}"
+            failure_type=FailureType.FAILED_PUSH_UP,
+            reason=f"Bulls failed at ${failure.failure_price:,.0f} | Sweep @ ${sweep.level:,.0f} reclaimed",
+            why_old_system_would_lose=why_old_loses
         )
         
         if signal.is_valid:
-            # Remove used sweep
-            self.recent_sweeps[symbol] = [s for s in self.recent_sweeps[symbol] if s != sweep]
+            self.pending_sweeps[symbol] = [s for s in self.pending_sweeps[symbol] if s != sweep]
+            self.failed_pushes[symbol] = [f for f in self.failed_pushes[symbol] if f != failure]
             return signal
         return None
 
@@ -588,11 +524,13 @@ class InstitutionalStrategy:
 @dataclass
 class ActivePosition:
     """
-    Tracks an active position with STRUCTURAL SL management.
+    Position with ANTI-RETAIL SL management.
     
-    SL moves ONLY on new structure:
-    - LONG: New Higher Low formed
-    - SHORT: New Lower High formed
+    SL moves ONLY when structure changes:
+    - LONG: New Higher Low
+    - SHORT: New Lower High
+    
+    NO early breakeven. NO mechanical trailing.
     """
     signal: TradeSignal
     order_id: str
@@ -600,62 +538,55 @@ class ActivePosition:
     entry_time: datetime
     
     current_sl: float = field(init=False)
-    last_structure_level: float = field(init=False)
     tp1_hit: bool = False
     tp2_hit: bool = False
     remaining_qty: float = field(init=False)
     
     def __post_init__(self):
         self.current_sl = self.signal.stop_loss
-        self.last_structure_level = self.signal.stop_loss
         self.remaining_qty = self.quantity
     
     def check_structure_for_sl_move(self, candles: List[Candle]) -> bool:
         """
-        Check if new structure formed for SL movement.
-        Returns True if SL was moved.
+        Move SL ONLY on structural change.
+        
+        LONG: Higher Low formed
+        SHORT: Lower High formed
         """
-        if len(candles) < 3:
+        if len(candles) < 5:
             return False
         
         if self.signal.direction == TradeDirection.LONG:
-            # Look for Higher Low
-            recent_lows = [c.low for c in candles[-5:]]
-            min_low = min(recent_lows[:-1]) if len(recent_lows) > 1 else recent_lows[0]
-            current_low = recent_lows[-1]
-            
-            # If current low is higher than recent lows and above our SL
-            if current_low > min_low and current_low > self.current_sl:
-                new_sl = current_low * 0.999  # Small buffer
-                if new_sl > self.current_sl:
-                    self.current_sl = new_sl
-                    self.last_structure_level = current_low
-                    return True
+            # Find Higher Low
+            lows = [c.low for c in candles[-5:]]
+            for i in range(1, len(lows) - 1):
+                # Check if middle is lower than neighbors (swing low)
+                if lows[i] < lows[i-1] and lows[i] < lows[i+1]:
+                    if lows[i] > self.current_sl:
+                        new_sl = lows[i] * 0.998
+                        if new_sl > self.current_sl:
+                            self.current_sl = new_sl
+                            return True
         
         else:  # SHORT
-            # Look for Lower High
-            recent_highs = [c.high for c in candles[-5:]]
-            max_high = max(recent_highs[:-1]) if len(recent_highs) > 1 else recent_highs[0]
-            current_high = recent_highs[-1]
-            
-            # If current high is lower than recent highs and below our SL
-            if current_high < max_high and current_high < self.current_sl:
-                new_sl = current_high * 1.001  # Small buffer
-                if new_sl < self.current_sl:
-                    self.current_sl = new_sl
-                    self.last_structure_level = current_high
-                    return True
+            highs = [c.high for c in candles[-5:]]
+            for i in range(1, len(highs) - 1):
+                if highs[i] > highs[i-1] and highs[i] > highs[i+1]:
+                    if highs[i] < self.current_sl:
+                        new_sl = highs[i] * 1.002
+                        if new_sl < self.current_sl:
+                            self.current_sl = new_sl
+                            return True
         
         return False
     
     def get_partial_qty_tp1(self) -> float:
-        return self.quantity * 0.4  # 40% at TP1
+        return self.quantity * 0.4
     
     def get_partial_qty_tp2(self) -> float:
-        return self.quantity * 0.4  # 40% at TP2, 20% runners
+        return self.quantity * 0.4
     
     def should_exit(self, current_price: float) -> Tuple[bool, str]:
-        """Check if SL hit."""
         if self.signal.direction == TradeDirection.LONG:
             if current_price <= self.current_sl:
                 return True, "STOP_LOSS"
@@ -665,9 +596,7 @@ class ActivePosition:
         return False, ""
     
     def check_tp_levels(self, current_price: float) -> Optional[str]:
-        """Check TP levels."""
-        direction = self.signal.direction
-        if direction == TradeDirection.LONG:
+        if self.signal.direction == TradeDirection.LONG:
             if not self.tp1_hit and current_price >= self.signal.tp1:
                 return "TP1"
             if not self.tp2_hit and current_price >= self.signal.tp2:

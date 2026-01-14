@@ -21,8 +21,8 @@ import websockets
 import json
 
 from strategy.institutional_strategy import (
-    InstitutionalStrategy, TradeSignal, ActivePosition, 
-    Candle, TradeDirection, MarketRegime, EntryType
+    FailureReversalStrategy, TradeSignal, ActivePosition, 
+    Candle, TradeDirection, MarketState, FailureType
 )
 
 logger = logging.getLogger(__name__)
@@ -54,21 +54,21 @@ class BotRunner:
         self._trade_callback = None
         self._log_callback = None
         
-        # Strategy
-        self.strategy = InstitutionalStrategy(max_positions=3)
+        # Strategy - FAILURE-BASED REVERSAL (ANTI-RETAIL)
+        self.strategy = FailureReversalStrategy(max_positions=3)
         
         # Multi-position tracking (one per symbol)
         self.active_positions: Dict[str, ActivePosition] = {}
         self.max_positions = 3
         
-        # Trading state - Institutional Scalping Model
+        # Trading state - FAILURE REVERSAL (fewer, higher quality)
         self.trades_today = 0
         self.losses_today = 0
         self.daily_pnl = 0.0
         self.starting_balance = 0.0
         
-        # Trade limits
-        self.max_trades_per_day = 15  # 10-15 trades/day
+        # Trade limits - REDUCED (trade less, win more)
+        self.max_trades_per_day = 10  # 5-10 trades/day ONLY
         self.max_losses_per_day = 4   # Stop after 4 losses
         self.daily_loss_cap_pct = 0.02  # 2% daily loss = stop
         self.daily_profit_lock_pct = 0.015  # 1.5% profit = stop
@@ -136,12 +136,12 @@ class BotRunner:
         self.kline_task = asyncio.create_task(self._stream_klines())
         self.strategy_task = asyncio.create_task(self._strategy_loop())
         
-        self._log(f"🚀 INSTITUTIONAL SCALPING BOT STARTED")
+        self._log(f"🚀 ANTI-RETAIL FAILURE REVERSAL BOT STARTED")
         self._log(f"💰 Starting Balance: ${self.starting_balance:,.2f}")
         self._log(f"📊 Monitoring: {settings.get('symbols', [])}")
         self._log(f"⚠️ Mode: {settings.get('mode', 'testnet').upper()}")
-        self._log(f"🎯 Strategy: Liquidity-Driven Mean Reversion")
-        self._log(f"📉 Risk: {self.risk_per_trade_pct*100:.1f}% | Max Trades: {self.max_trades_per_day}")
+        self._log(f"🎯 Strategy: Failure-Based Liquidity Reversal")
+        self._log(f"📉 Trade AFTER failure, not before | Max: {self.max_trades_per_day}/day")
         
         if self._status_callback:
             self._status_callback("running")
