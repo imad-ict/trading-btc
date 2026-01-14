@@ -292,34 +292,29 @@ class BotRunner:
                 
                 # Periodic diagnostics every 30 seconds (6 x 5-second loops)
                 if diagnostic_counter % 6 == 0:
-                    for symbol in list(self.prices.keys())[:1]:  # Just first symbol
+                    for symbol in list(self.prices.keys()):  # ALL symbols
                         diag = self.strategy.get_diagnostics(symbol)
                         levels_count = len(diag.get("liquidity_levels", []))
-                        candles_5m = diag.get("candles_5m", 0)
-                        market_state = diag.get("market_state", "unknown")
+                        candles_1m = diag.get("candles_1m", 0)
+                        market_state = diag.get("market_state", "expansion")
                         vwap = diag.get("vwap")
                         
-                        self._log(f"📊 {symbol}: 5M candles={candles_5m}, Levels={levels_count}, State={market_state}")
+                        self._log(f"📊 {symbol}: 1M={candles_1m}, Levels={levels_count}, State={market_state}")
                         
                         if levels_count > 0:
-                            for lv in diag["liquidity_levels"][:3]:
+                            for lv in diag["liquidity_levels"][:2]:
                                 status = "✓" if not lv["swept"] else "⊗"
-                                self._log(f"   {status} {lv['type']}: ${lv['price']:,.2f} (touches: {lv['touches']})")
+                                self._log(f"   {status} {lv['type']}: ${lv['price']:,.2f}")
                         
                         if vwap:
                             price = self.prices.get(symbol, 0)
                             diff = ((price - vwap) / vwap * 100) if vwap else 0
                             self._log(f"   VWAP: ${vwap:,.2f} | Price: ${price:,.2f} ({diff:+.2f}%)")
                 
-                # Check market state and look for signals
+                # Check for signals on all symbols
                 for symbol in self.prices.keys():
-                    market_state = self.strategy.get_market_state(symbol)
-                    
-                    if market_state not in [MarketState.EXPANSION, MarketState.MANIPULATION]:
-                        continue
-                    
-                    # Check cooldown
-                    if time.time() - self.last_signal_time.get(symbol, 0) < self.signal_cooldown:
+                    # Reduced cooldown from 300s to 30s for faster trading
+                    if time.time() - self.last_signal_time.get(symbol, 0) < 30:
                         continue
                     
                     # Build current candle for signal check
