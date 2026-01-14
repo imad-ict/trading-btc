@@ -265,9 +265,12 @@ class BotRunner:
         await asyncio.sleep(60)
         self._log("📈 Data collection complete - Monitoring for signals")
         
+        diagnostic_counter = 0
+        
         while self.is_running:
             try:
                 await asyncio.sleep(5)
+                diagnostic_counter += 1
                 
                 if not self.prices:
                     continue
@@ -281,7 +284,28 @@ class BotRunner:
                 if self.trades_today >= self.max_trades_per_day:
                     continue
                 
-                # Check market state
+                # Periodic diagnostics every 30 seconds (6 x 5-second loops)
+                if diagnostic_counter % 6 == 0:
+                    for symbol in list(self.prices.keys())[:1]:  # Just first symbol
+                        diag = self.strategy.get_diagnostics(symbol)
+                        levels_count = len(diag.get("liquidity_levels", []))
+                        candles_5m = diag.get("candles_5m", 0)
+                        market_state = diag.get("market_state", "unknown")
+                        vwap = diag.get("vwap")
+                        
+                        self._log(f"📊 {symbol}: 5M candles={candles_5m}, Levels={levels_count}, State={market_state}")
+                        
+                        if levels_count > 0:
+                            for lv in diag["liquidity_levels"][:3]:
+                                status = "✓" if not lv["swept"] else "⊗"
+                                self._log(f"   {status} {lv['type']}: ${lv['price']:,.2f} (touches: {lv['touches']})")
+                        
+                        if vwap:
+                            price = self.prices.get(symbol, 0)
+                            diff = ((price - vwap) / vwap * 100) if vwap else 0
+                            self._log(f"   VWAP: ${vwap:,.2f} | Price: ${price:,.2f} ({diff:+.2f}%)")
+                
+                # Check market state and look for signals
                 for symbol in self.prices.keys():
                     market_state = self.strategy.get_market_state(symbol)
                     

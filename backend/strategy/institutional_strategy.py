@@ -122,8 +122,8 @@ class TradeSignal:
     @property
     def is_valid(self) -> bool:
         """Validate trade meets institutional criteria."""
-        # Risk must be between 0.15% and 0.35%
-        if self.risk_distance < 0.0015 or self.risk_distance > 0.0035:
+        # Risk must be between 0.1% and 0.5% (slightly relaxed for more opportunities)
+        if self.risk_distance < 0.001 or self.risk_distance > 0.005:
             return False
         return True
 
@@ -162,13 +162,38 @@ class InstitutionalStrategy:
         self.vwap: Dict[str, float] = {}
         self.vwap_data: Dict[str, List[Tuple[float, float]]] = {}  # (price, volume)
         
-        # Configuration
-        self.equal_level_tolerance = 0.0003  # 0.03% tolerance for equal levels
-        self.min_level_touches = 2
+        # Configuration - tuned for more opportunities while maintaining quality
+        self.equal_level_tolerance = 0.0005  # 0.05% tolerance for equal levels (slightly relaxed)
+        self.min_level_touches = 1  # Allow single-touch levels (swing highs/lows)
         self.sl_buffer_pct = 0.0005  # 0.05% buffer beyond wick
         self.max_candles_1m = 120  # 2 hours
         self.max_candles_5m = 60   # 5 hours
         self.max_candles_15m = 40  # 10 hours
+    
+    def get_diagnostics(self, symbol: str) -> Dict:
+        """Get diagnostic info about current market conditions."""
+        diagnostics = {
+            "symbol": symbol,
+            "candles_1m": len(self.candles_1m.get(symbol, [])),
+            "candles_5m": len(self.candles_5m.get(symbol, [])),
+            "candles_15m": len(self.candles_15m.get(symbol, [])),
+            "liquidity_levels": [],
+            "vwap": self.vwap.get(symbol),
+            "session_high": self.session_high.get(symbol),
+            "session_low": self.session_low.get(symbol),
+            "market_state": self.get_market_state(symbol).value if symbol in self.candles_15m else "unknown",
+        }
+        
+        if symbol in self.liquidity_levels:
+            for level in self.liquidity_levels[symbol][:5]:  # Top 5 levels
+                diagnostics["liquidity_levels"].append({
+                    "price": level.price,
+                    "type": level.level_type,
+                    "touches": level.touches,
+                    "swept": level.swept
+                })
+        
+        return diagnostics
     
     def add_candle(self, symbol: str, candle: Candle, timeframe: str = "1m"):
         """Add a candle and update all derived data."""
@@ -327,8 +352,9 @@ class InstitutionalStrategy:
             # Check for sell-side sweep (price goes below equal lows)
             if level.level_type == "equal_low":
                 if current_candle.low < level.price:
-                    # Wick must be larger than body (manipulation signature)
-                    if current_candle.lower_wick > current_candle.body_size:
+                    # Relaxed: Wick needs to be significant but not necessarily > body
+                    # Just need to see price go below and come back (the reclaim confirms)
+                    if current_candle.lower_wick > current_candle.body_size * 0.3:  # 30% of body
                         return {
                             "type": "sell_side_sweep",
                             "level": level,
@@ -340,7 +366,8 @@ class InstitutionalStrategy:
             # Check for buy-side sweep (price goes above equal highs)
             if level.level_type == "equal_high":
                 if current_candle.high > level.price:
-                    if current_candle.upper_wick > current_candle.body_size:
+                    # Relaxed: wick needs to be significant but not necessarily > body
+                    if current_candle.upper_wick > current_candle.body_size * 0.3:  # 30% of body
                         return {
                             "type": "buy_side_sweep",
                             "level": level,
@@ -386,9 +413,9 @@ class InstitutionalStrategy:
         avg_volume = np.mean([c.volume for c in recent_candles])
         current_volume = recent_candles[-1].volume
         
-        # Volume must be above average
-        if current_volume < avg_volume:
-            return False, f"Volume below average ({current_volume:.0f} < {avg_volume:.0f})"
+        # Volume should be reasonable (not drastically below average) - relaxed from strict requirement
+        if current_volume < avg_volume * 0.5:  # Only reject if volume is less than half average
+            return False, f"Volume too low ({current_volume:.0f} < {avg_volume*0.5:.0f})"
         
         # VWAP alignment
         if direction == TradeDirection.LONG:
