@@ -353,17 +353,19 @@ class InstitutionalStrategy:
         if not vwap:
             return None
         
-        # RULE 1: Don't trade ranging markets
-        if trend == TrendDirection.RANGING:
-            return None
+        # RULE 1: Check for Order Block entry (requires trend)
+        if trend != TrendDirection.RANGING:
+            signal = self._check_order_block_entry(symbol, current_candle, trend, rsi)
+            if signal:
+                return signal
         
-        # RULE 2: Check for Order Block entry
-        signal = self._check_order_block_entry(symbol, current_candle, trend, rsi)
+        # RULE 2: Check for VWAP pullback (works in any market)
+        signal = self._check_vwap_pullback(symbol, current_candle, trend, rsi)
         if signal:
             return signal
         
-        # RULE 3: Check for VWAP pullback (in trend direction)
-        signal = self._check_vwap_pullback(symbol, current_candle, trend, rsi)
+        # RULE 3: Momentum entry (strong candle with RSI confirmation)
+        signal = self._check_momentum_entry(symbol, current_candle, rsi)
         if signal:
             return signal
         
@@ -377,12 +379,12 @@ class InstitutionalStrategy:
         for ob in order_blocks:
             ob_mid = (ob.top + ob.bottom) / 2
             
-            # LONG: Bullish trend + Bullish OB + RSI oversold + Price at OB + Bullish candle
+            # LONG: Bullish trend + Bullish OB + RSI < 50 + Price at OB + Bullish candle
             if (trend == TrendDirection.BULLISH and 
                 ob.direction == "bullish" and
-                rsi < 40 and  # RSI showing oversold pullback
+                rsi < 50 and  # RSI below 50 is good enough
                 candle.low <= ob.top and candle.close > ob_mid and
-                candle.is_bullish and candle.body_pct > 0.4):
+                candle.is_bullish and candle.body_pct > 0.3):
                 
                 ob.valid = False  # Mark as used
                 return self._create_signal(
@@ -391,12 +393,12 @@ class InstitutionalStrategy:
                     f"Order Block Long @ ${ob_mid:,.0f}"
                 )
             
-            # SHORT: Bearish trend + Bearish OB + RSI overbought + Price at OB + Bearish candle
+            # SHORT: Bearish trend + Bearish OB + RSI > 50 + Price at OB + Bearish candle
             if (trend == TrendDirection.BEARISH and 
                 ob.direction == "bearish" and
-                rsi > 60 and  # RSI showing overbought pullback
+                rsi > 50 and  # RSI above 50 is good enough
                 candle.high >= ob.bottom and candle.close < ob_mid and
-                not candle.is_bullish and candle.body_pct > 0.4):
+                not candle.is_bullish and candle.body_pct > 0.3):
                 
                 ob.valid = False
                 return self._create_signal(
@@ -409,7 +411,7 @@ class InstitutionalStrategy:
     
     def _check_vwap_pullback(self, symbol: str, candle: Candle,
                               trend: TrendDirection, rsi: float) -> Optional[TradeSignal]:
-        """VWAP pullback in trend direction."""
+        """VWAP pullback - works in trending AND ranging markets."""
         vwap = self.vwap.get(symbol)
         if not vwap:
             return None
@@ -417,11 +419,11 @@ class InstitutionalStrategy:
         price = candle.close
         vwap_dist = (price - vwap) / vwap
         
-        # LONG: Bullish trend + pullback to VWAP + RSI recovering from oversold + bullish candle
-        if (trend == TrendDirection.BULLISH and
-            abs(vwap_dist) < 0.002 and  # Within 0.2% of VWAP
-            30 < rsi < 45 and  # RSI recovering from oversold
-            candle.is_bullish and candle.body_pct > 0.5):
+        # LONG: Price near VWAP from below + RSI not overbought + bullish candle
+        if (abs(vwap_dist) < 0.003 and  # Within 0.3% of VWAP
+            price > vwap and  # Just crossed above
+            rsi < 60 and  # Not overbought
+            candle.is_bullish and candle.body_pct > 0.35):
             
             sl = min(candle.low, vwap) * (1 - self.sl_buffer_pct)
             return self._create_signal(
@@ -430,17 +432,53 @@ class InstitutionalStrategy:
                 f"VWAP Pullback Long"
             )
         
-        # SHORT: Bearish trend + pullback to VWAP + RSI dropping from overbought + bearish candle
-        if (trend == TrendDirection.BEARISH and
-            abs(vwap_dist) < 0.002 and
-            55 < rsi < 70 and
-            not candle.is_bullish and candle.body_pct > 0.5):
+        # SHORT: Price near VWAP from above + RSI not oversold + bearish candle
+        if (abs(vwap_dist) < 0.003 and  # Within 0.3% of VWAP
+            price < vwap and  # Just crossed below
+            rsi > 40 and  # Not oversold
+            not candle.is_bullish and candle.body_pct > 0.35):
             
             sl = max(candle.high, vwap) * (1 + self.sl_buffer_pct)
             return self._create_signal(
                 symbol, TradeDirection.SHORT, EntryType.VWAP_PULLBACK,
                 candle.close, sl, trend, rsi,
                 f"VWAP Pullback Short"
+            )
+        
+        return None
+    
+    def _check_momentum_entry(self, symbol: str, candle: Candle, rsi: float) -> Optional[TradeSignal]:
+        """
+        Momentum entry - strong candle with RSI confirmation.
+        Works in any market when we see clear momentum.
+        """
+        vwap = self.vwap.get(symbol)
+        if not vwap:
+            return None
+        
+        trend = self.trend.get(symbol, TrendDirection.RANGING)
+        
+        # Need a strong candle (body > 60% of range)
+        if candle.body_pct < 0.6:
+            return None
+        
+        # LONG: Strong bullish candle + RSI rising but not overbought
+        if candle.is_bullish and 40 < rsi < 65:
+            # SL just below the candle low
+            sl = candle.low * (1 - self.sl_buffer_pct)
+            return self._create_signal(
+                symbol, TradeDirection.LONG, EntryType.LIQUIDITY_SWEEP,  # Use existing type
+                candle.close, sl, trend, rsi,
+                f"Momentum Long"
+            )
+        
+        # SHORT: Strong bearish candle + RSI falling but not oversold
+        if not candle.is_bullish and 35 < rsi < 60:
+            sl = candle.high * (1 + self.sl_buffer_pct)
+            return self._create_signal(
+                symbol, TradeDirection.SHORT, EntryType.LIQUIDITY_SWEEP,
+                candle.close, sl, trend, rsi,
+                f"Momentum Short"
             )
         
         return None
