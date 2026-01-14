@@ -22,7 +22,7 @@ import json
 
 from strategy.institutional_strategy import (
     InstitutionalStrategy, TradeSignal, ActivePosition, 
-    Candle, TradeDirection, TrendDirection, EntryType
+    Candle, TradeDirection, MarketRegime, EntryType
 )
 
 logger = logging.getLogger(__name__)
@@ -61,11 +61,11 @@ class BotRunner:
         self.active_positions: Dict[str, ActivePosition] = {}
         self.max_positions = 3
         
-        # Trading state
+        # Trading state - REDUCED for quality over quantity
         self.trades_today = 0
-        self.max_trades_per_day = 15
+        self.max_trades_per_day = 6  # Max 6 trades/day
         self.last_signal_time: Dict[str, float] = {}
-        self.signal_cooldown = 60  # 1 minute cooldown per symbol
+        self.signal_cooldown = 300  # 5 minute cooldown per symbol
         
         # Candle aggregation
         self.current_candle: Dict[str, Dict] = {}
@@ -398,26 +398,31 @@ class BotRunner:
         if not current_price:
             return
         
-        # Check for exit
+        # Check for exit (SL or structure break)
         should_exit, reason = pos.should_exit(current_price)
         if should_exit:
             await self._close_full_position_for_symbol(symbol, reason, current_price)
             return
         
-        # Check TP levels
+        # STRUCTURAL SL MOVEMENT: Check if new structure formed
+        candles = list(self.strategy.candles_5m.get(symbol, []))
+        if pos.check_structure_for_sl_move(candles):
+            self._log(f"📍 {symbol} SL → Structure: ${pos.current_sl:,.2f}")
+        
+        # Check TP levels for partial closes
         tp_hit = pos.check_tp_levels(current_price)
         
         if tp_hit == "TP1" and not pos.tp1_hit:
             self._log(f"🎯 {symbol} TP1 HIT @ ${current_price:,.2f}")
             await self._partial_close_for_symbol(symbol, pos.get_partial_qty_tp1(), "TP1", current_price)
-            pos.move_sl_to_breakeven()
-            self._log(f"📍 {symbol} SL → BE: ${pos.current_sl:,.2f}")
+            pos.tp1_hit = True
+            # NOTE: Do NOT move SL to breakeven here - wait for structure
         
         elif tp_hit == "TP2" and not pos.tp2_hit:
             self._log(f"🎯 {symbol} TP2 HIT @ ${current_price:,.2f}")
             await self._partial_close_for_symbol(symbol, pos.get_partial_qty_tp2(), "TP2", current_price)
-            pos.move_sl_to_tp1()
-            self._log(f"📍 {symbol} SL → TP1: ${pos.current_sl:,.2f}")
+            pos.tp2_hit = True
+            # NOTE: Do NOT move SL to TP1 here - wait for structure
         
         elif tp_hit == "TP3":
             self._log(f"🎯 {symbol} TP3 HIT - Full exit @ ${current_price:,.2f}")
