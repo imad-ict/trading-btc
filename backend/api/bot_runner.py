@@ -55,14 +55,17 @@ class BotRunner:
         self._log_callback = None
         
         # Strategy
-        self.strategy = InstitutionalStrategy()
-        self.active_position: Optional[ActivePosition] = None
+        self.strategy = InstitutionalStrategy(max_positions=3)
+        
+        # Multi-position tracking (one per symbol)
+        self.active_positions: Dict[str, ActivePosition] = {}
+        self.max_positions = 3
         
         # Trading state
         self.trades_today = 0
-        self.max_trades_per_day = 10
+        self.max_trades_per_day = 15
         self.last_signal_time: Dict[str, float] = {}
-        self.signal_cooldown = 300  # 5 minutes
+        self.signal_cooldown = 60  # 1 minute cooldown per symbol
         
         # Candle aggregation
         self.current_candle: Dict[str, Dict] = {}
@@ -325,11 +328,32 @@ class BotRunner:
                             price = self.prices.get(symbol, 0)
                             diff = ((price - vwap) / vwap * 100) if vwap else 0
                             self._log(f"   VWAP: ${vwap:,.2f} | Price: ${price:,.2f} ({diff:+.2f}%)")
+                    
+                    # Show active positions count
+                    if self.active_positions:
+                        pos_info = ", ".join([f"{s}:{p.signal.direction.value}" for s, p in self.active_positions.items()])
+                        self._log(f"📍 Active: {len(self.active_positions)}/{self.max_positions} [{pos_info}]")
                 
-                # Check for signals on all symbols
+                # Manage ALL active positions
+                for symbol in list(self.active_positions.keys()):
+                    await self._manage_position_for_symbol(symbol)
+                
+                # Check trade limits
+                if self.trades_today >= self.max_trades_per_day:
+                    continue
+                
+                # Check position limit
+                if len(self.active_positions) >= self.max_positions:
+                    continue
+                
+                # Check for signals on symbols WITHOUT active positions
                 for symbol in self.prices.keys():
-                    # Reduced cooldown from 300s to 30s for faster trading
-                    if time.time() - self.last_signal_time.get(symbol, 0) < 30:
+                    # Skip if already has position
+                    if symbol in self.active_positions:
+                        continue
+                    
+                    # Per-symbol cooldown (60 seconds)
+                    if time.time() - self.last_signal_time.get(symbol, 0) < self.signal_cooldown:
                         continue
                     
                     # Build current candle for signal check
@@ -351,13 +375,13 @@ class BotRunner:
                             self._log(f"{'='*50}")
                             self._log(f"Symbol: {signal.symbol}")
                             self._log(f"Direction: {signal.direction.value}")
+                            self._log(f"Entry Type: {signal.entry_type.value}")
                             self._log(f"Entry: ${signal.entry_price:,.2f}")
                             self._log(f"Stop Loss: ${signal.stop_loss:,.2f}")
-                            self._log(f"TP1 (VWAP): ${signal.tp1:,.2f}")
-                            self._log(f"TP2 (Liq): ${signal.tp2:,.2f}")
-                            self._log(f"TP3 (Ext): ${signal.tp3:,.2f}")
+                            self._log(f"TP1: ${signal.tp1:,.2f}")
+                            self._log(f"TP2: ${signal.tp2:,.2f}")
+                            self._log(f"TP3: ${signal.tp3:,.2f}")
                             self._log(f"Reason: {signal.reason}")
-                            self._log(f"Market State: {signal.market_state.value}")
                             self._log(f"Risk: {signal.risk_distance*100:.3f}%")
                             self._log(f"{'='*50}")
                             
@@ -365,7 +389,6 @@ class BotRunner:
                             
                             if success:
                                 self.last_signal_time[symbol] = time.time()
-                                break
                 
             except asyncio.CancelledError:
                 break
@@ -373,13 +396,12 @@ class BotRunner:
                 logger.error(f"Strategy error: {e}")
                 await asyncio.sleep(5)
     
-    async def _manage_position(self):
-        """Manage active position with dynamic SL and partial closes."""
-        if not self.active_position:
+    async def _manage_position_for_symbol(self, symbol: str):
+        """Manage position for a specific symbol with dynamic SL and partial closes."""
+        if symbol not in self.active_positions:
             return
         
-        pos = self.active_position
-        symbol = pos.signal.symbol
+        pos = self.active_positions[symbol]
         current_price = self.prices.get(symbol)
         
         if not current_price:
@@ -388,27 +410,27 @@ class BotRunner:
         # Check for exit
         should_exit, reason = pos.should_exit(current_price)
         if should_exit:
-            await self._close_full_position(reason, current_price)
+            await self._close_full_position_for_symbol(symbol, reason, current_price)
             return
         
         # Check TP levels
         tp_hit = pos.check_tp_levels(current_price)
         
         if tp_hit == "TP1" and not pos.tp1_hit:
-            self._log(f"🎯 TP1 HIT @ ${current_price:,.2f}")
-            await self._partial_close(pos.get_partial_qty_tp1(), "TP1", current_price)
+            self._log(f"🎯 {symbol} TP1 HIT @ ${current_price:,.2f}")
+            await self._partial_close_for_symbol(symbol, pos.get_partial_qty_tp1(), "TP1", current_price)
             pos.move_sl_to_breakeven()
-            self._log(f"📍 SL moved to breakeven: ${pos.current_sl:,.2f}")
+            self._log(f"📍 {symbol} SL → BE: ${pos.current_sl:,.2f}")
         
         elif tp_hit == "TP2" and not pos.tp2_hit:
-            self._log(f"🎯 TP2 HIT @ ${current_price:,.2f}")
-            await self._partial_close(pos.get_partial_qty_tp2(), "TP2", current_price)
+            self._log(f"🎯 {symbol} TP2 HIT @ ${current_price:,.2f}")
+            await self._partial_close_for_symbol(symbol, pos.get_partial_qty_tp2(), "TP2", current_price)
             pos.move_sl_to_tp1()
-            self._log(f"📍 SL moved to TP1: ${pos.current_sl:,.2f}")
+            self._log(f"📍 {symbol} SL → TP1: ${pos.current_sl:,.2f}")
         
         elif tp_hit == "TP3":
-            self._log(f"🎯 TP3 HIT - Full exit @ ${current_price:,.2f}")
-            await self._close_full_position("FULL_TP", current_price)
+            self._log(f"🎯 {symbol} TP3 HIT - Full exit @ ${current_price:,.2f}")
+            await self._close_full_position_for_symbol(symbol, "FULL_TP", current_price)
     
     async def _execute_trade(self, signal: TradeSignal) -> bool:
         """Execute trade on Binance Futures."""
@@ -471,7 +493,8 @@ class BotRunner:
                     order = response.json()
                     self._log(f"✅ ORDER EXECUTED: {side} {quantity} {signal.symbol}")
                     
-                    self.active_position = ActivePosition(
+                    # Add to multi-position dict
+                    self.active_positions[signal.symbol] = ActivePosition(
                         signal=signal,
                         order_id=str(order.get("orderId", "")),
                         quantity=quantity,
@@ -499,12 +522,12 @@ class BotRunner:
             self._log(f"❌ Trade execution error: {e}")
             return False
     
-    async def _partial_close(self, quantity: float, reason: str, exit_price: float):
-        """Close partial position."""
-        if not self.active_position:
+    async def _partial_close_for_symbol(self, symbol: str, quantity: float, reason: str, exit_price: float):
+        """Close partial position for a symbol."""
+        if symbol not in self.active_positions:
             return
         
-        pos = self.active_position
+        pos = self.active_positions[symbol]
         mode = self.settings.get("mode", "testnet")
         api_key = self.settings.get(f"{mode}_api_key", "")
         api_secret = self.settings.get(f"{mode}_api_secret", "")
@@ -517,15 +540,14 @@ class BotRunner:
         try:
             side = "SELL" if pos.signal.direction == TradeDirection.LONG else "BUY"
             
-            # Round quantity to symbol precision (CRITICAL for Binance)
-            rounded_qty = self._round_quantity(pos.signal.symbol, quantity)
+            rounded_qty = self._round_quantity(symbol, quantity)
             if rounded_qty <= 0:
-                self._log(f"⚠️ Quantity too small after rounding: {quantity} → {rounded_qty}")
+                self._log(f"⚠️ {symbol} qty too small: {quantity}")
                 return
             
             timestamp = int(time.time() * 1000)
             params = {
-                "symbol": pos.signal.symbol,
+                "symbol": symbol,
                 "side": side,
                 "type": "MARKET",
                 "quantity": rounded_qty,
@@ -547,21 +569,21 @@ class BotRunner:
                 
                 if response.status_code == 200:
                     pnl_pct = self._calculate_pnl_pct(pos, exit_price)
-                    self._log(f"✅ Partial close ({reason}): {quantity} @ ${exit_price:,.2f} | P&L: {pnl_pct:.2f}%")
-                    pos.remaining_qty -= quantity
+                    self._log(f"✅ {symbol} partial ({reason}): {rounded_qty} @ ${exit_price:,.2f} | {pnl_pct:.2f}%")
+                    pos.remaining_qty -= rounded_qty
                 else:
                     error = response.json().get("msg", response.text)
-                    self._log(f"❌ Partial close failed: {error}")
+                    self._log(f"❌ {symbol} partial failed: {error}")
                     
         except Exception as e:
-            self._log(f"❌ Partial close error: {e}")
+            self._log(f"❌ {symbol} partial error: {e}")
     
-    async def _close_full_position(self, reason: str, exit_price: float):
-        """Close full remaining position."""
-        if not self.active_position:
+    async def _close_full_position_for_symbol(self, symbol: str, reason: str, exit_price: float):
+        """Close full remaining position for a symbol."""
+        if symbol not in self.active_positions:
             return
         
-        pos = self.active_position
+        pos = self.active_positions[symbol]
         mode = self.settings.get("mode", "testnet")
         api_key = self.settings.get(f"{mode}_api_key", "")
         api_secret = self.settings.get(f"{mode}_api_secret", "")
@@ -574,16 +596,15 @@ class BotRunner:
         try:
             side = "SELL" if pos.signal.direction == TradeDirection.LONG else "BUY"
             
-            # Round quantity to symbol precision
-            rounded_qty = self._round_quantity(pos.signal.symbol, pos.remaining_qty)
+            rounded_qty = self._round_quantity(symbol, pos.remaining_qty)
             if rounded_qty <= 0:
-                self._log(f"⚠️ Remaining quantity too small: {pos.remaining_qty}")
-                self.active_position = None
+                self._log(f"⚠️ {symbol} remaining qty too small")
+                del self.active_positions[symbol]
                 return
             
             timestamp = int(time.time() * 1000)
             params = {
-                "symbol": pos.signal.symbol,
+                "symbol": symbol,
                 "side": side,
                 "type": "MARKET",
                 "quantity": rounded_qty,
@@ -610,19 +631,17 @@ class BotRunner:
                     
                     self._log(f"")
                     self._log(f"{'='*50}")
-                    self._log(f"{emoji} POSITION CLOSED - {reason}")
+                    self._log(f"{emoji} {symbol} CLOSED - {reason}")
                     self._log(f"{'='*50}")
-                    self._log(f"Result: {result}")
-                    self._log(f"P&L: {pnl_pct:.2f}%")
-                    self._log(f"Entry: ${pos.signal.entry_price:,.2f}")
-                    self._log(f"Exit: ${exit_price:,.2f}")
+                    self._log(f"Result: {result} | P&L: {pnl_pct:.2f}%")
+                    self._log(f"Entry: ${pos.signal.entry_price:,.2f} → Exit: ${exit_price:,.2f}")
                     self._log(f"{'='*50}")
                     
-                    # Broadcast trade completion to frontend
+                    # Broadcast trade completion
                     if self._trade_callback:
                         self._trade_callback({
                             "event": "close",
-                            "symbol": pos.signal.symbol,
+                            "symbol": symbol,
                             "direction": pos.signal.direction.value,
                             "entry": pos.signal.entry_price,
                             "exit": exit_price,
@@ -633,13 +652,14 @@ class BotRunner:
                             "reason": reason
                         })
                     
-                    self.active_position = None
+                    # Remove from active positions
+                    del self.active_positions[symbol]
                 else:
                     error = response.json().get("msg", response.text)
-                    self._log(f"❌ Close failed: {error}")
+                    self._log(f"❌ {symbol} close failed: {error}")
                     
         except Exception as e:
-            self._log(f"❌ Close position error: {e}")
+            self._log(f"❌ {symbol} close error: {e}")
     
     def _calculate_pnl_pct(self, pos: ActivePosition, exit_price: float) -> float:
         """Calculate P&L percentage."""
