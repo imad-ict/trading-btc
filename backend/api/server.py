@@ -181,12 +181,14 @@ bot_state: Dict[str, Any] = {
     "balance": 0.0,
     "daily_pnl": 0.0,
     "trades_today": 0,
+    "wins_today": 0,
     "losses_today": 0,
     "streak": 0,
     "is_halted": False,
     "halt_reason": None,
     "active_trade": None,
     "price": {},  # symbol -> price
+    "trades": [],  # Trade history list
 }
 
 
@@ -479,6 +481,19 @@ async def get_metrics():
         )
 
 
+@app.get("/api/trades")
+async def get_trades():
+    """Get all trades history."""
+    return {
+        "trades": bot_state["trades"],
+        "trades_today": bot_state["trades_today"],
+        "wins_today": bot_state["wins_today"],
+        "losses_today": bot_state["losses_today"],
+        "streak": bot_state["streak"],
+        "daily_pnl": bot_state["daily_pnl"]
+    }
+
+
 @app.get("/api/active-trade")
 async def get_active_trade():
     """Get current active trade if any."""
@@ -489,7 +504,7 @@ async def get_active_trade():
 
 @app.post("/api/emergency-stop")
 async def emergency_stop(request: EmergencyStopRequest):
-    """Emergency stop - close all positions."""
+    """Emergency stop - close all positions on Binance."""
     if not request.confirm:
         raise HTTPException(status_code=400, detail="Confirmation required")
     
@@ -498,16 +513,98 @@ async def emergency_stop(request: EmergencyStopRequest):
     bot_state["halt_reason"] = "Emergency stop triggered via API"
     bot_state["status"] = "halted"
     
+    # Close all positions on Binance
+    close_result = await _close_all_binance_positions()
+    
+    # Stop the bot
+    await bot_runner.stop()
+    
     # Broadcast immediately
     await manager.broadcast({
         "type": "emergency_stop",
-        "data": {"halted": True},
+        "data": {"halted": True, "positions_closed": close_result},
         "timestamp": datetime.utcnow().isoformat(),
     })
     
-    logger.warning("EMERGENCY STOP TRIGGERED VIA API")
+    logger.warning(f"EMERGENCY STOP TRIGGERED VIA API - Positions closed: {close_result}")
     
-    return {"success": True, "message": "Emergency stop triggered"}
+    return {"success": True, "message": "Emergency stop triggered", "positions_closed": close_result}
+
+
+async def _close_all_binance_positions():
+    """Close all open positions on Binance."""
+    mode = app_settings.get("mode", "testnet")
+    api_key = app_settings.get(f"{mode}_api_key", "")
+    api_secret = app_settings.get(f"{mode}_api_secret", "")
+    
+    if not api_key or not api_secret:
+        return {"error": "No API keys configured"}
+    
+    if mode == "testnet":
+        base_url = "https://testnet.binancefuture.com"
+    else:
+        base_url = "https://fapi.binance.com"
+    
+    try:
+        import hmac
+        import hashlib
+        import time
+        
+        # Get open positions
+        timestamp = int(time.time() * 1000)
+        query = f"timestamp={timestamp}"
+        signature = hmac.new(api_secret.encode(), query.encode(), hashlib.sha256).hexdigest()
+        
+        async with httpx.AsyncClient(timeout=10) as client:
+            response = await client.get(
+                f"{base_url}/fapi/v2/positionRisk",
+                params={"timestamp": timestamp, "signature": signature},
+                headers={"X-MBX-APIKEY": api_key}
+            )
+            
+            if response.status_code != 200:
+                return {"error": response.text}
+            
+            positions = response.json()
+            closed = []
+            
+            for pos in positions:
+                amt = float(pos.get("positionAmt", 0))
+                if amt != 0:
+                    symbol = pos["symbol"]
+                    side = "SELL" if amt > 0 else "BUY"
+                    quantity = abs(amt)
+                    
+                    # Close position
+                    timestamp = int(time.time() * 1000)
+                    params = {
+                        "symbol": symbol,
+                        "side": side,
+                        "type": "MARKET",
+                        "quantity": quantity,
+                        "timestamp": timestamp,
+                    }
+                    query_string = "&".join([f"{k}={v}" for k, v in params.items()])
+                    signature = hmac.new(api_secret.encode(), query_string.encode(), hashlib.sha256).hexdigest()
+                    params["signature"] = signature
+                    
+                    close_response = await client.post(
+                        f"{base_url}/fapi/v1/order",
+                        params=params,
+                        headers={"X-MBX-APIKEY": api_key}
+                    )
+                    
+                    if close_response.status_code == 200:
+                        closed.append(symbol)
+                        logger.info(f"Closed position: {symbol} {side} {quantity}")
+                    else:
+                        logger.error(f"Failed to close {symbol}: {close_response.text}")
+            
+            return {"closed": closed, "count": len(closed)}
+            
+    except Exception as e:
+        logger.error(f"Error closing positions: {e}")
+        return {"error": str(e)}
 
 
 @app.get("/api/settings")
@@ -615,7 +712,47 @@ def _log_callback(message: str):
 def _trade_callback(trade: dict):
     """Broadcast trade updates to dashboard."""
     import asyncio
-    bot_state["active_trade"] = trade
+    
+    # Handle trade close - persist to history and update metrics
+    if trade.get("event") == "close":
+        # Add to trade history
+        trade_record = {
+            "id": str(len(bot_state["trades"]) + 1),
+            "symbol": trade.get("symbol"),
+            "direction": trade.get("direction"),
+            "entry_price": trade.get("entry"),
+            "exit_price": trade.get("exit"),
+            "stop_loss": trade.get("sl"),
+            "status": "closed",
+            "result": trade.get("result"),
+            "pnl_usd": trade.get("pnl_usd"),
+            "pnl_pct": trade.get("pnl_pct"),
+            "liquidity_event": trade.get("reason", ""),
+            "market_state": "expansion",
+            "entry_logic": trade.get("reason", ""),
+            "exit_time": datetime.utcnow().isoformat()
+        }
+        bot_state["trades"].append(trade_record)
+        
+        # Update counters
+        bot_state["trades_today"] += 1
+        if trade.get("result") == "WIN":
+            bot_state["wins_today"] += 1
+            bot_state["streak"] = max(0, bot_state["streak"]) + 1
+        else:
+            bot_state["losses_today"] += 1
+            bot_state["streak"] = min(0, bot_state["streak"]) - 1
+        
+        # Update daily P&L
+        bot_state["daily_pnl"] += trade.get("pnl_usd", 0)
+        
+        # Clear active trade
+        bot_state["active_trade"] = None
+    else:
+        # Trade opened
+        bot_state["active_trade"] = trade
+    
+    # Broadcast to frontend
     asyncio.create_task(manager.broadcast({
         "type": "trade",
         "data": trade,
