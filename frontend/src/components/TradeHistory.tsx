@@ -4,7 +4,8 @@ import { useTradeStore } from '@/stores/tradeStore'
 import clsx from 'clsx'
 
 export default function TradeHistory() {
-    const { activeTrade, trades, prices, botStatus } = useTradeStore()
+    const { activeTrade, trades, prices, status } = useTradeStore()
+
 
     // Get current price for active trade
     const currentPrice = activeTrade
@@ -38,7 +39,7 @@ export default function TradeHistory() {
                         <div className="text-3xl mb-2">📊</div>
                         <div className="text-terminal-muted text-sm">No active positions</div>
                         <div className="text-terminal-muted text-xs mt-1">
-                            {botStatus === 'running' ? 'Waiting for signal...' : 'Start bot to trade'}
+                            {status === 'running' ? 'Waiting for signal...' : 'Start bot to trade'}
                         </div>
                     </div>
                 ) : (
