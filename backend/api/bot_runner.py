@@ -407,7 +407,7 @@ class BotRunner:
                             self._log(f"{'='*50}")
                             self._log(f"Symbol: {signal.symbol}")
                             self._log(f"Direction: {signal.direction.value}")
-                            self._log(f"Entry Type: {signal.entry_type.value}")
+                            self._log(f"Type: {signal.failure_type.value}")
                             self._log(f"Entry: ${signal.entry_price:,.2f}")
                             self._log(f"Stop Loss: ${signal.stop_loss:,.2f}")
                             self._log(f"TP1: ${signal.tp1:,.2f}")
