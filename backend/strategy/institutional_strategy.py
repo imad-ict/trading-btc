@@ -297,8 +297,9 @@ class InstitutionalStrategy:
     
     def get_market_state(self, symbol: str) -> MarketState:
         """Determine market state from 15M structure."""
+        # Default to EXPANSION if not enough data (allows trading to proceed)
         if symbol not in self.candles_15m or len(self.candles_15m[symbol]) < 5:
-            return MarketState.UNKNOWN
+            return MarketState.EXPANSION
         
         candles = list(self.candles_15m[symbol])[-10:]
         

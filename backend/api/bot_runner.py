@@ -174,7 +174,7 @@ class BotRunner:
                     await asyncio.sleep(5)
     
     async def _stream_klines(self):
-        """Stream 5-minute klines for liquidity detection."""
+        """Stream 5-minute and 15-minute klines for liquidity and market state detection."""
         symbols = self.settings.get("symbols", ["BTCUSDT", "ETHUSDT", "SOLUSDT"])
         mode = self.settings.get("mode", "testnet")
         
@@ -183,14 +183,18 @@ class BotRunner:
         else:
             ws_base = "wss://fstream.binance.com/ws"
         
-        # 5-minute klines for liquidity structure
-        streams = [f"{s.lower()}@kline_5m" for s in symbols]
+        # Stream both 5M (liquidity) and 15M (market state) klines
+        streams = []
+        for s in symbols:
+            streams.append(f"{s.lower()}@kline_5m")
+            streams.append(f"{s.lower()}@kline_15m")
+        
         ws_url = f"{ws_base}/{'/'.join(streams)}"
         
         while self.is_running:
             try:
                 async with websockets.connect(ws_url) as ws:
-                    self._log(f"📊 5M Kline stream connected")
+                    self._log(f"📊 5M + 15M Kline streams connected")
                     
                     while self.is_running:
                         try:
@@ -208,7 +212,9 @@ class BotRunner:
                                         close=float(k["c"]),
                                         volume=float(k["v"])
                                     )
-                                    self.strategy.add_candle(k["s"], candle, "5m")
+                                    # Determine timeframe from interval
+                                    timeframe = "5m" if k["i"] == "5m" else "15m"
+                                    self.strategy.add_candle(k["s"], candle, timeframe)
                         
                         except asyncio.TimeoutError:
                             await ws.ping()
