@@ -67,14 +67,14 @@ class BotRunner:
         self.daily_pnl = 0.0
         self.starting_balance = 0.0
         
-        # Trade limits - REDUCED (trade less, win more)
-        self.max_trades_per_day = 10  # 5-10 trades/day ONLY
-        self.max_losses_per_day = 4   # Stop after 4 losses
+        # Trade limits - HIGHER FREQUENCY
+        self.max_trades_per_day = 20  # More trades
+        self.max_losses_per_day = 6   # Stop after 6 losses
         self.daily_loss_cap_pct = 0.02  # 2% daily loss = stop
         self.daily_profit_lock_pct = 0.015  # 1.5% profit = stop
         
         self.last_signal_time: Dict[str, float] = {}
-        self.signal_cooldown = 180  # 3 minute cooldown per symbol
+        self.signal_cooldown = 60  # 1 minute cooldown per symbol
         
         # Risk parameters
         self.risk_per_trade_pct = 0.003  # 0.3% risk per trade
@@ -457,7 +457,9 @@ class BotRunner:
             self._log(f"🎯 {symbol} TP1 HIT @ ${current_price:,.2f}")
             await self._partial_close_for_symbol(symbol, pos.get_partial_qty_tp1(), "TP1", current_price)
             pos.tp1_hit = True
-            # NOTE: Do NOT move SL to breakeven here - wait for structure
+            # Move SL to entry (breakeven)
+            pos.current_sl = pos.signal.entry_price
+            self._log(f"📍 {symbol} SL → ENTRY (BE): ${pos.current_sl:,.2f}")
         
         elif tp_hit == "TP2" and not pos.tp2_hit:
             self._log(f"🎯 {symbol} TP2 HIT @ ${current_price:,.2f}")
