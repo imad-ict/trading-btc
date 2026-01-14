@@ -299,15 +299,6 @@ class BotRunner:
                 if not self.prices:
                     continue
                 
-                # Check active position
-                if self.active_position:
-                    await self._manage_position()
-                    continue
-                
-                # Check trade limits
-                if self.trades_today >= self.max_trades_per_day:
-                    continue
-                
                 # Periodic diagnostics every 30 seconds (6 x 5-second loops)
                 if diagnostic_counter % 6 == 0:
                     for symbol in list(self.prices.keys()):  # ALL symbols
