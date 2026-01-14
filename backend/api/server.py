@@ -603,7 +603,26 @@ def _update_price(symbol: str, price: float):
 def _update_bot_status(status: str):
     bot_state["status"] = status
 
-bot_runner.set_callbacks(_update_price, _update_bot_status)
+def _log_callback(message: str):
+    """Broadcast log messages to dashboard."""
+    import asyncio
+    asyncio.create_task(manager.broadcast({
+        "type": "log",
+        "message": message,
+        "timestamp": datetime.utcnow().isoformat()
+    }))
+
+def _trade_callback(trade: dict):
+    """Broadcast trade updates to dashboard."""
+    import asyncio
+    bot_state["active_trade"] = trade
+    asyncio.create_task(manager.broadcast({
+        "type": "trade",
+        "data": trade,
+        "timestamp": datetime.utcnow().isoformat()
+    }))
+
+bot_runner.set_callbacks(_update_price, _update_bot_status, _trade_callback, _log_callback)
 
 
 @app.post("/api/bot/start")

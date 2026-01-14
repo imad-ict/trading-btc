@@ -101,22 +101,21 @@ export function useWebSocket() {
                 break
 
             case 'trade':
-                if (data.state === 'ENTRY_EXECUTED' || data.state === 'POSITION_MANAGEMENT') {
+                if (data) {
                     setActiveTrade({
                         symbol: data.symbol,
                         direction: data.direction,
-                        entry_price: data.entry_price,
-                        stop_loss: data.stop_loss,
+                        entry_price: data.entry,
+                        stop_loss: data.sl,
                     })
-                } else if (data.state === 'EXIT_LOGGED') {
-                    addTrade(data)
-                    setActiveTrade(null)
+                    addExplanationLog(`✅ Trade opened: ${data.direction} ${data.symbol} @ $${data.entry}`)
                 }
+                break
 
-                // Add to explanation log
-                if (data.liquidity_event || data.entry_logic) {
-                    const log = `[${new Date().toLocaleTimeString()}] ${data.direction} ${data.symbol}: ${data.liquidity_event || data.entry_logic}`
-                    addExplanationLog(log)
+            case 'log':
+                // Bot log messages
+                if (message.message) {
+                    addExplanationLog(message.message)
                 }
                 break
 
@@ -125,7 +124,8 @@ export function useWebSocket() {
                 break
 
             default:
-                console.log('Unknown message type:', type)
+                // Ignore unknown message types silently
+                break
         }
     }, [updateFromStatus, updatePrice, setActiveTrade, addTrade, addExplanationLog, setHalted])
 
